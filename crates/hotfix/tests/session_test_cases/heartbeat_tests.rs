@@ -1,4 +1,5 @@
-use crate::common::session_actions::{SessionActions, when_time_elapses};
+use crate::common::actions::when;
+use crate::common::assertions::then;
 use crate::common::setup::{HEARTBEAT_INTERVAL, given_an_active_session};
 use hotfix_message::Part;
 use hotfix_message::fix44::MSG_TYPE;
@@ -18,13 +19,15 @@ async fn test_heartbeats() {
     let (session, mut mock_counterparty) = given_an_active_session().await;
 
     // let's wait enough time for a heartbeat and assert that the heartbeat was sent
-    when_time_elapses(Duration::from_secs(HEARTBEAT_INTERVAL + 1)).await;
-    mock_counterparty
-        .then_receives(|msg| assert_eq!(msg.header().get::<&str>(MSG_TYPE).unwrap(), "0"))
+    when(Duration::from_secs(HEARTBEAT_INTERVAL + 1))
+        .elapses()
+        .await;
+    then(&mut mock_counterparty)
+        .receives(|msg| assert_eq!(msg.header().get::<&str>(MSG_TYPE).unwrap(), "0"))
         .await;
 
-    session.when_disconnect_is_requested().await;
-    mock_counterparty.then_gets_disconnected().await;
+    when(&session).requests_disconnect().await;
+    then(&mut mock_counterparty).gets_disconnected().await;
 }
 
 /// Tests the peer timeout and disconnection mechanism:
@@ -42,19 +45,23 @@ async fn test_peer_timeout() {
     let (_session, mut mock_counterparty) = given_an_active_session().await;
 
     // let's wait enough time for a heartbeat and assert that the heartbeat was sent
-    when_time_elapses(Duration::from_secs(HEARTBEAT_INTERVAL + 1)).await;
-    mock_counterparty
-        .then_receives(|msg| assert_eq!(msg.header().get::<&str>(MSG_TYPE).unwrap(), "0"))
+    when(Duration::from_secs(HEARTBEAT_INTERVAL + 1))
+        .elapses()
+        .await;
+    then(&mut mock_counterparty)
+        .receives(|msg| assert_eq!(msg.header().get::<&str>(MSG_TYPE).unwrap(), "0"))
         .await;
 
     // we wait enough time for the peer deadline to pass
-    when_time_elapses(Duration::from_secs(peer_interval - HEARTBEAT_INTERVAL)).await;
+    when(Duration::from_secs(peer_interval - HEARTBEAT_INTERVAL))
+        .elapses()
+        .await;
     // a TestRequest (type '1') is sent to the counterparty
-    mock_counterparty
-        .then_receives(|msg| assert_eq!(msg.header().get::<&str>(MSG_TYPE).unwrap(), "1"))
+    then(&mut mock_counterparty)
+        .receives(|msg| assert_eq!(msg.header().get::<&str>(MSG_TYPE).unwrap(), "1"))
         .await;
 
     // we wait even longer and the counterparty never responds, so we disconnect from the counterparty
-    when_time_elapses(Duration::from_secs(peer_interval)).await;
-    mock_counterparty.then_gets_disconnected().await;
+    when(Duration::from_secs(peer_interval)).elapses().await;
+    then(&mut mock_counterparty).gets_disconnected().await;
 }

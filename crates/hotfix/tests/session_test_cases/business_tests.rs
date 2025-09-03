@@ -1,4 +1,5 @@
-use crate::common::session_actions::SessionActions;
+use crate::common::actions::when;
+use crate::common::assertions::then;
 use crate::common::setup::given_an_active_session;
 use crate::common::test_messages::TestMessage;
 use hotfix::message::FixMessage;
@@ -8,21 +9,21 @@ async fn test_new_order_single() {
     let (session, mut mock_counterparty) = given_an_active_session().await;
 
     // we send a new order to the counterparty and they receive it successfully
-    session
-        .when_message_is_sent(TestMessage::dummy_new_order_single())
+    when(&session)
+        .sends_message(TestMessage::dummy_new_order_single())
         .await;
-    mock_counterparty
-        .then_receives(|msg| {
+    then(&mut mock_counterparty)
+        .receives(|msg| {
             let parsed = TestMessage::parse(msg);
             assert_eq!(parsed.message_type(), "D");
         })
         .await;
 
-    mock_counterparty
-        .when_message_is_sent(TestMessage::dummy_execution_report())
+    when(&mut mock_counterparty)
+        .sends_message(TestMessage::dummy_execution_report())
         .await;
     // TODO: we currently have no good way of asserting this message was received
 
-    session.when_disconnect_is_requested().await;
-    mock_counterparty.then_gets_disconnected().await;
+    when(&session).requests_disconnect().await;
+    then(&mut mock_counterparty).gets_disconnected().await;
 }
