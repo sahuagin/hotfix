@@ -1,9 +1,9 @@
 /// Operations on a growable in-memory buffer.
 ///
-/// This trait is intented to be used as a thin compatibility layer between
+/// This trait is intended to be used as a thin compatibility layer between
 /// [`Vec<u8>`] and
 /// [`bytes::BytesMut`](https://docs.rs/bytes/1.1.0/bytes/struct.BytesMut.html).
-/// By writing generic code that operates on [`Buffer`], FerrumFIX users can
+/// By writing generic code that operates on [`Buffer`], HotFIX users can
 /// decide for themselves if they want to use `bytes` and still use most of the
 /// features.
 ///
@@ -21,6 +21,12 @@ pub trait Buffer {
     #[inline]
     fn len(&self) -> usize {
         self.as_slice().len()
+    }
+
+    /// Returns `true` if the buffer is empty.
+    #[inline]
+    fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 
     /// Returns the number of bytes that `self` can hold without reallocating.
