@@ -12,7 +12,9 @@ use hotfix::session::SessionRef;
 use hotfix::store::mongodb::Client;
 use hotfix_status::build_router;
 use std::path::Path;
+use tokio::select;
 use tokio::task::spawn_blocking;
+use tokio_util::sync::CancellationToken;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
@@ -63,12 +65,21 @@ async fn main() {
     let app = TestApplication::default();
     let initiator = start_session(&args.config, &db_config, app).await;
 
-    tokio::spawn(start_status_service(initiator.session_ref()));
+    let status_service_token = CancellationToken::new();
+    tokio::spawn(start_status_service(
+        initiator.session_ref(),
+        status_service_token.clone(),
+    ));
 
-    user_loop(initiator).await;
+    user_loop(&initiator).await;
+    status_service_token.cancel();
+    initiator
+        .shutdown()
+        .await
+        .expect("graceful shutdown to succeed");
 }
 
-async fn user_loop(session: Initiator<Message>) {
+async fn user_loop(session: &Initiator<Message>) {
     loop {
         println!("(q) to quit, (s) to send message");
 
@@ -85,7 +96,7 @@ async fn user_loop(session: Initiator<Message>) {
                 return;
             }
             "s" => {
-                send_message(&session).await;
+                send_message(session).await;
             }
             _ => {
                 println!("Unrecognised command");
@@ -126,7 +137,7 @@ async fn start_session(
         Database::Redb => {
             let store = hotfix::store::redb::RedbMessageStore::new("session.db")
                 .expect("be able to create store");
-            Initiator::new(session_config, app, store).await
+            Initiator::start(session_config, app, store).await
         }
         Database::Mongodb => {
             let uri = "mongodb://localhost:30001";
@@ -137,16 +148,29 @@ async fn start_session(
                 hotfix::store::mongodb::MongoDbMessageStore::new(client.database("hotfix"), None)
                     .await
                     .expect("be able to create store");
-            Initiator::new(session_config, app, store).await
+            Initiator::start(session_config, app, store).await
         }
     }
 }
 
-async fn start_status_service(session_ref: SessionRef<Message>) {
+async fn start_status_service(
+    session_ref: SessionRef<Message>,
+    cancellation_token: CancellationToken,
+) {
     let status_router = build_router(session_ref);
     let host_and_port = std::env::var("HOST_AND_PORT").unwrap_or("0.0.0.0:9881".to_string());
     let listener = tokio::net::TcpListener::bind(&host_and_port).await.unwrap();
 
     info!("starting status service on http://{host_and_port}");
-    axum::serve(listener, status_router).await.unwrap();
+
+    select! {
+        result = axum::serve(listener, status_router) => {
+            if let Err(e) = result {
+                tracing::error!("status service error: {}", e);
+            }
+        },
+        () = cancellation_token.cancelled() => {
+            info!("status service cancelled");
+        }
+    }
 }

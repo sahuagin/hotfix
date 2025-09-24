@@ -20,10 +20,11 @@ use crate::transport::connect;
 pub struct Initiator<M> {
     pub config: SessionConfig,
     session: SessionRef<M>,
+    connection_loop_handle: tokio::task::JoinHandle<()>,
 }
 
 impl<M: FixMessage> Initiator<M> {
-    pub async fn new(
+    pub async fn start(
         config: SessionConfig,
         application: impl Application<M>,
         store: impl MessageStore + Send + Sync + 'static,
@@ -31,7 +32,7 @@ impl<M: FixMessage> Initiator<M> {
         let application_ref = ApplicationRef::new(application);
         let session_ref = SessionRef::new(config.clone(), application_ref, store);
 
-        tokio::spawn({
+        let connection_loop_handle = tokio::spawn({
             let config = config.clone();
             let session_ref = session_ref.clone();
             establish_connection(config, session_ref)
@@ -40,6 +41,7 @@ impl<M: FixMessage> Initiator<M> {
         Self {
             config,
             session: session_ref,
+            connection_loop_handle,
         }
     }
 
@@ -54,23 +56,21 @@ impl<M: FixMessage> Initiator<M> {
     pub fn session_ref(&self) -> SessionRef<M> {
         self.session.clone()
     }
+
+    pub async fn shutdown(self) -> Result<(), tokio::task::JoinError> {
+        self.session.shutdown().await;
+        self.connection_loop_handle.await
+    }
 }
 
 async fn establish_connection<M: FixMessage>(config: SessionConfig, session_ref: SessionRef<M>) {
     loop {
-        if !session_ref.should_reconnect().await {
-            warn!("session indicated we shouldn't reconnect");
-            break;
-        }
         session_ref.await_active_session_time().await;
 
         match connect(&config, session_ref.clone()).await {
             Ok(conn) => {
                 session_ref.register_writer(conn.get_writer()).await;
-
-                // TODO: should this ask the session about disconnects?
                 conn.run_until_disconnect().await;
-
                 warn!("session connection dropped, attempting to reconnect");
             }
             Err(err) => {
@@ -79,6 +79,10 @@ async fn establish_connection<M: FixMessage>(config: SessionConfig, session_ref:
             }
         };
 
+        if !session_ref.should_reconnect().await {
+            warn!("session indicated we shouldn't reconnect");
+            break;
+        }
         let reconnect_interval = config.reconnect_interval;
         debug!("waiting for {reconnect_interval} seconds before attempting to reconnect");
         sleep(Duration::from_secs(reconnect_interval)).await;
