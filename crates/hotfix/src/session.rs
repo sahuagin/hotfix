@@ -7,7 +7,7 @@ use anyhow::{Result, anyhow};
 use chrono::Utc;
 use hotfix_message::dict::Dictionary;
 use hotfix_message::message::{Config as MessageConfig, Message};
-use hotfix_message::{Part, fix44};
+use hotfix_message::{MessageBuilder, Part, fix44};
 use std::cmp::Ordering;
 use std::pin::Pin;
 use tokio::select;
@@ -50,7 +50,7 @@ struct Session<M, S> {
     message_config: MessageConfig,
     config: SessionConfig,
     schedule: SessionSchedule,
-    dictionary: Dictionary,
+    message_builder: MessageBuilder,
     state: SessionState,
     application: ApplicationRef<M>,
     store: S,
@@ -67,14 +67,17 @@ impl<M: FixMessage, S: MessageStore> Session<M, S> {
         let schedule_check_timer = sleep(Duration::from_secs(SCHEDULE_CHECK_INTERVAL));
 
         let dictionary = Self::get_data_dictionary(&config);
+        let message_config = MessageConfig::default();
+        let message_builder = MessageBuilder::new(dictionary, message_config)
+            .expect("failed to create message builder");
         let schedule = config.schedule.as_ref().try_into().unwrap();
 
         Self {
             mailbox,
             config,
             schedule,
-            message_config: MessageConfig::default(),
-            dictionary,
+            message_config,
+            message_builder,
             state: SessionState::new_disconnected(true, "initialising"),
             application,
             store,
@@ -100,11 +103,7 @@ impl<M: FixMessage, S: MessageStore> Session<M, S> {
             self.reset_peer_timer(None);
         }
 
-        match Message::from_bytes(
-            &self.message_config,
-            &self.dictionary,
-            raw_message.as_bytes(),
-        ) {
+        match self.message_builder.build(raw_message.as_bytes()) {
             ParsedMessage::Valid(message) => {
                 self.process_message(message).await?;
                 self.check_end_of_resend().await?;
@@ -135,6 +134,21 @@ impl<M: FixMessage, S: MessageStore> Session<M, S> {
                 }
                 InvalidReason::InvalidMsgType(msg_type) => {
                     self.handle_invalid_msg_type(message, &msg_type).await;
+                }
+                InvalidReason::InvalidOrderInGroup { tag, .. } => {
+                    match message.header().get(fix44::MSG_SEQ_NUM) {
+                        Ok(msg_seq_num) => {
+                            let reject = Reject::new(msg_seq_num)
+                                .session_reject_reason(
+                                    SessionRejectReason::RepeatingGroupFieldsOutOfOrder,
+                                )
+                                .text(&format!("field appears in incorrect order:{tag}"));
+                            self.send_message(reject).await;
+                        }
+                        Err(err) => {
+                            error!("failed to get message seq num: {:?}", err);
+                        }
+                    }
                 }
             },
             ParsedMessage::UnexpectedError(err) => {
@@ -642,10 +656,11 @@ impl<M: FixMessage, S: MessageStore> Session<M, S> {
         for msg in messages {
             let m = String::from_utf8(msg.clone()).unwrap();
             debug!(m, "resending message");
-            let mut message =
-                Message::from_bytes(&self.message_config, &self.dictionary, msg.as_slice())
-                    .into_message()
-                    .unwrap();
+            let mut message = self
+                .message_builder
+                .build(msg.as_slice())
+                .into_message()
+                .unwrap();
             sequence_number = message.header().get(fix44::MSG_SEQ_NUM).unwrap();
             let message_type: String = message
                 .header()
