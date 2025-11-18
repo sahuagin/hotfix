@@ -8,6 +8,8 @@ use crate::common::test_messages::{
     build_execution_report_with_incorrect_body_length,
     build_execution_report_with_incorrect_orig_sending_time,
     build_execution_report_with_missing_orig_sending_time,
+    build_execution_report_with_missing_sending_time,
+    build_execution_report_with_sending_time_too_old,
 };
 use hotfix::session::Status;
 use hotfix_message::Part;
@@ -273,7 +275,7 @@ async fn test_message_with_incorrect_orig_sending_time_is_rejected() {
 async fn test_message_with_missing_orig_sending_time_is_rejected() {
     let (session, mut mock_counterparty) = given_an_active_session().await;
 
-    // A valid execution report is sent and processed normally
+    // a valid execution report is sent and processed normally
     let seq_number = mock_counterparty.next_target_sequence_number();
     when(&mut mock_counterparty)
         .sends_message(TestMessage::dummy_execution_report())
@@ -297,6 +299,74 @@ async fn test_message_with_missing_orig_sending_time_is_rejected() {
                 SessionRejectReason::RequiredTagMissing
             );
         })
+        .await;
+
+    when(&session).requests_disconnect().await;
+    then(&mut mock_counterparty).gets_disconnected().await;
+}
+
+/// Tests that a message with missing `SendingTime` is rejected.
+///
+/// `SendingTime` is a required field in all FIX messages.
+#[tokio::test]
+async fn test_message_with_missing_sending_time_is_rejected() {
+    let (session, mut mock_counterparty) = given_an_active_session().await;
+
+    // a message with missing SendingTime is sent by the counterparty
+    let seq_number = mock_counterparty.next_target_sequence_number();
+    when(&mut mock_counterparty)
+        .sends_raw_message(build_execution_report_with_missing_sending_time(seq_number))
+        .await;
+
+    // then we send a reject with the appropriate reason
+    then(&mut mock_counterparty)
+        .receives(|msg| {
+            assert_msg_type(msg, MsgType::Reject);
+            assert_eq!(
+                msg.get::<SessionRejectReason>(SESSION_REJECT_REASON)
+                    .unwrap(),
+                SessionRejectReason::SendingtimeAccuracyProblem
+            );
+        })
+        .await;
+
+    // our target sequence number should be incremented
+    then(&session)
+        .target_sequence_number_reaches(seq_number)
+        .await;
+
+    when(&session).requests_disconnect().await;
+    then(&mut mock_counterparty).gets_disconnected().await;
+}
+
+/// Tests that a message with `SendingTime` too far in the past is rejected.
+///
+/// Messages with `SendingTime` more than 120 seconds in the past should be rejected.
+#[tokio::test]
+async fn test_message_with_sending_time_too_old_is_rejected() {
+    let (session, mut mock_counterparty) = given_an_active_session().await;
+
+    // a message with SendingTime 121 seconds in the past is sent by the counterparty
+    let seq_number = mock_counterparty.next_target_sequence_number();
+    when(&mut mock_counterparty)
+        .sends_raw_message(build_execution_report_with_sending_time_too_old(seq_number))
+        .await;
+
+    // then we send a reject with the appropriate reason
+    then(&mut mock_counterparty)
+        .receives(|msg| {
+            assert_msg_type(msg, MsgType::Reject);
+            assert_eq!(
+                msg.get::<SessionRejectReason>(SESSION_REJECT_REASON)
+                    .unwrap(),
+                SessionRejectReason::SendingtimeAccuracyProblem
+            );
+        })
+        .await;
+
+    // our target sequence number should be incremented
+    then(&session)
+        .target_sequence_number_reaches(seq_number)
         .await;
 
     when(&session).requests_disconnect().await;
