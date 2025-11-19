@@ -14,7 +14,6 @@ use tokio::sync::mpsc;
 use tokio::time::{Duration, Instant, Sleep, sleep, sleep_until};
 use tracing::{debug, error, info, warn};
 
-use crate::application::{ApplicationMessage, ApplicationRef};
 use crate::config::SessionConfig;
 use crate::message::FixMessage;
 use crate::message::generate_message;
@@ -37,6 +36,8 @@ use hotfix_message::fix44::SessionRejectReason;
 use hotfix_message::parsed_message::{InvalidReason, ParsedMessage};
 use state::SessionState;
 
+use crate::Application;
+use crate::application::{InboundDecision, OutboundDecision};
 use crate::message::reject::Reject;
 use crate::message::verification::verify_message;
 pub use info::{SessionInfo, Status};
@@ -44,25 +45,25 @@ pub use session_ref::SessionRef;
 
 const SCHEDULE_CHECK_INTERVAL: u64 = 1;
 
-struct Session<M, S> {
+struct Session<A, M, S> {
     mailbox: mpsc::Receiver<SessionEvent<M>>,
     message_config: MessageConfig,
     config: SessionConfig,
     schedule: SessionSchedule,
     message_builder: MessageBuilder,
     state: SessionState,
-    application: ApplicationRef<M>,
+    application: A,
     store: S,
     schedule_check_timer: Pin<Box<Sleep>>,
 }
 
-impl<M: FixMessage, S: MessageStore> Session<M, S> {
+impl<A: Application<M>, M: FixMessage, S: MessageStore> Session<A, M, S> {
     fn new(
         mailbox: mpsc::Receiver<SessionEvent<M>>,
         config: SessionConfig,
-        application: ApplicationRef<M>,
+        application: A,
         store: S,
-    ) -> Session<M, S> {
+    ) -> Session<A, M, S> {
         let schedule_check_timer = sleep(Duration::from_secs(SCHEDULE_CHECK_INTERVAL));
 
         let dictionary = Self::get_data_dictionary(&config);
@@ -214,8 +215,13 @@ impl<M: FixMessage, S: MessageStore> Session<M, S> {
         match self.verify_message(message).await {
             Ok(_) => {
                 let parsed_message = M::parse(message);
-                let app_message = ApplicationMessage::ReceivedMessage(parsed_message);
-                self.application.send_message(app_message).await;
+                if matches!(
+                    self.application.on_inbound_message(parsed_message).await,
+                    InboundDecision::TerminateSession
+                ) {
+                    error!("failed to send inbound message to application");
+                    self.state.disconnect().await;
+                }
                 self.store.increment_target_seq_number().await?;
             }
             Err(err) => self.handle_verification_error(err).await,
@@ -303,6 +309,7 @@ impl<M: FixMessage, S: MessageStore> Session<M, S> {
                     // happy logon flow, the session is now active
                     self.state =
                         SessionState::new_active(writer.clone(), self.config.heartbeat_interval);
+                    self.application.on_logon().await;
                     self.store.increment_target_seq_number().await?;
                 }
                 Err(err) => self.handle_verification_error(err).await,
@@ -322,9 +329,7 @@ impl<M: FixMessage, S: MessageStore> Session<M, S> {
             // TODO: reconnect = false isn't always valid, this should be more sophisticated
             self.state.disconnect().await;
             self.state = SessionState::LoggedOut { reconnect: false };
-            self.application
-                .send_logout("peer has logged us out".to_string())
-                .await;
+            self.application.on_logout("peer has logged us out").await;
         }
         self.store.increment_target_seq_number().await
     }
@@ -648,6 +653,21 @@ impl<M: FixMessage, S: MessageStore> Session<M, S> {
             .reset_peer_timer(self.config.heartbeat_interval, test_request_id);
     }
 
+    async fn send_app_message(&mut self, message: M) {
+        match self.application.on_outbound_message(&message).await {
+            OutboundDecision::Send => {
+                self.send_message(message).await;
+            }
+            OutboundDecision::Drop => {
+                debug!("dropped outbound message as instructed by the application");
+            }
+            OutboundDecision::TerminateSession => {
+                error!("failed to send message to application");
+                self.state.disconnect().await;
+            }
+        }
+    }
+
     async fn send_message(&mut self, message: impl FixMessage) {
         let seq_num = self.store.next_sender_seq_number();
         self.store.increment_sender_seq_number().await.unwrap();
@@ -735,7 +755,7 @@ impl<M: FixMessage, S: MessageStore> Session<M, S> {
                 }
             }
             SessionEvent::SendMessage(message) => {
-                self.send_message(message).await;
+                self.send_app_message(message).await;
             }
             SessionEvent::Disconnected(reason) => {
                 warn!(reason, "disconnected from peer");
@@ -832,8 +852,9 @@ impl<M: FixMessage, S: MessageStore> Session<M, S> {
     }
 }
 
-async fn run_session<M, S>(mut session: Session<M, S>)
+async fn run_session<A, M, S>(mut session: Session<A, M, S>)
 where
+    A: Application<M>,
     M: FixMessage,
     S: MessageStore + Send + 'static,
 {
