@@ -1,6 +1,8 @@
-mod event;
+pub(crate) mod admin_request;
+pub(crate) mod event;
 mod info;
-mod session_ref;
+mod session_handle;
+pub mod session_ref;
 mod state;
 
 use crate::config::SessionConfig;
@@ -22,30 +24,35 @@ use tokio::sync::mpsc;
 use tokio::time::{Duration, Instant, Sleep, sleep, sleep_until};
 use tracing::{debug, enabled, error, info, warn};
 
+use crate::Application;
+use crate::application::{InboundDecision, OutboundDecision};
 use crate::error::{CompIdType, MessageVerificationError};
 use crate::message::logout::Logout;
+use crate::message::reject::Reject;
 use crate::message::resend_request::ResendRequest;
 use crate::message::sequence_reset::SequenceReset;
 use crate::message::test_request::TestRequest;
+use crate::message::verification::verify_message;
 use crate::message_utils::{is_admin, prepare_message_for_resend};
+use crate::session::admin_request::AdminRequest;
+use crate::session::state::SessionState;
 use crate::session::state::{AwaitingResendTransitionOutcome, TestRequestId};
 use crate::session_schedule::SessionSchedule;
 use event::SessionEvent;
 use hotfix_message::fix44::SessionRejectReason;
 use hotfix_message::parsed_message::{InvalidReason, ParsedMessage};
-use state::SessionState;
 
-use crate::Application;
-use crate::application::{InboundDecision, OutboundDecision};
-use crate::message::reject::Reject;
-use crate::message::verification::verify_message;
-pub use info::{SessionInfo, Status};
-pub use session_ref::SessionRef;
+#[cfg(not(feature = "test-utils"))]
+pub(crate) use crate::session::session_ref::InternalSessionRef;
+#[cfg(feature = "test-utils")]
+pub use crate::session::session_ref::InternalSessionRef;
+
+pub use crate::session::info::{SessionInfo, Status};
+pub use crate::session::session_handle::SessionHandle;
 
 const SCHEDULE_CHECK_INTERVAL: u64 = 1;
 
 struct Session<A, M, S> {
-    mailbox: mpsc::Receiver<SessionEvent<M>>,
     message_config: MessageConfig,
     config: SessionConfig,
     schedule: SessionSchedule,
@@ -54,15 +61,12 @@ struct Session<A, M, S> {
     application: A,
     store: S,
     schedule_check_timer: Pin<Box<Sleep>>,
+    reset_on_next_logon: bool,
+    _phantom: std::marker::PhantomData<fn() -> M>,
 }
 
 impl<A: Application<M>, M: FixMessage, S: MessageStore> Session<A, M, S> {
-    fn new(
-        mailbox: mpsc::Receiver<SessionEvent<M>>,
-        config: SessionConfig,
-        application: A,
-        store: S,
-    ) -> Session<A, M, S> {
+    fn new(config: SessionConfig, application: A, store: S) -> Session<A, M, S> {
         let schedule_check_timer = sleep(Duration::from_secs(SCHEDULE_CHECK_INTERVAL));
 
         let dictionary = Self::get_data_dictionary(&config);
@@ -72,7 +76,6 @@ impl<A: Application<M>, M: FixMessage, S: MessageStore> Session<A, M, S> {
         let schedule = config.schedule.as_ref().try_into().unwrap();
 
         Self {
-            mailbox,
             config,
             schedule,
             message_config,
@@ -81,6 +84,8 @@ impl<A: Application<M>, M: FixMessage, S: MessageStore> Session<A, M, S> {
             application,
             store,
             schedule_check_timer: Box::pin(schedule_check_timer),
+            reset_on_next_logon: false,
+            _phantom: std::marker::PhantomData,
         }
     }
 
@@ -211,7 +216,7 @@ impl<A: Application<M>, M: FixMessage, S: MessageStore> Session<A, M, S> {
     }
 
     async fn process_app_message(&mut self, message: &Message) -> Result<()> {
-        match self.verify_message(message).await {
+        match self.verify_message(message) {
             Ok(_) => {
                 let parsed_message = M::parse(message);
                 if matches!(
@@ -260,7 +265,7 @@ impl<A: Application<M>, M: FixMessage, S: MessageStore> Session<A, M, S> {
         Ok(())
     }
 
-    async fn verify_message(
+    fn verify_message(
         &self,
         message: &Message,
     ) -> std::result::Result<(), MessageVerificationError> {
@@ -303,7 +308,7 @@ impl<A: Application<M>, M: FixMessage, S: MessageStore> Session<A, M, S> {
     async fn on_logon(&mut self, message: &Message) -> Result<()> {
         // TODO: this should wait to see if a resend request is sent
         if let SessionState::AwaitingLogon { writer, .. } = &self.state {
-            match self.verify_message(message).await {
+            match self.verify_message(message) {
                 Ok(_) => {
                     // happy logon flow, the session is now active
                     self.state =
@@ -750,12 +755,14 @@ impl<A: Application<M>, M: FixMessage, S: MessageStore> Session<A, M, S> {
     }
 
     async fn send_logon(&mut self) {
-        let reset_config = if self.config.reset_on_logon {
+        let reset_config = if self.config.reset_on_logon || self.reset_on_next_logon {
             self.store.reset().await.unwrap();
             ResetSeqNumConfig::Reset
         } else {
             ResetSeqNumConfig::NoReset(Some(self.store.next_target_seq_number()))
         };
+        self.reset_on_next_logon = false;
+
         let logon = Logon::new(self.config.heartbeat_interval, reset_config);
 
         self.send_message(logon).await;
@@ -777,7 +784,7 @@ impl<A: Application<M>, M: FixMessage, S: MessageStore> Session<A, M, S> {
         }
     }
 
-    async fn handle(&mut self, event: SessionEvent<M>) {
+    async fn handle_session_event(&mut self, event: SessionEvent) {
         self.handle_schedule_check().await;
 
         match event {
@@ -787,9 +794,6 @@ impl<A: Application<M>, M: FixMessage, S: MessageStore> Session<A, M, S> {
                     error!(reason, "fatal error in message processing");
                     self.logout_and_terminate("internal error").await;
                 }
-            }
-            SessionEvent::SendMessage(message) => {
-                self.send_app_message(message).await;
             }
             SessionEvent::Disconnected(reason) => {
                 warn!(reason, "disconnected from peer");
@@ -806,15 +810,27 @@ impl<A: Application<M>, M: FixMessage, S: MessageStore> Session<A, M, S> {
             SessionEvent::AwaitingActiveSession(responder) => {
                 self.state.register_session_awaiter(responder);
             }
-            SessionEvent::SessionInfoRequested(responder) => {
+        }
+    }
+
+    async fn handle_outbound_message(&mut self, message: M) {
+        self.send_app_message(message).await;
+    }
+
+    async fn handle_admin_request(&mut self, request: AdminRequest) {
+        match request {
+            AdminRequest::InitiateGracefulShutdown { reconnect } => {
+                // TODO: revisit logout & shutdown flows once logout timeouts are implemented
+                self.logout_and_terminate("shutdown requested").await;
+                self.state = SessionState::new_disconnected(reconnect, "shutdown requested");
+            }
+            AdminRequest::RequestSessionInfo(responder) => {
                 if responder.send(self.get_session_info()).is_err() {
                     error!("failed to respond to session info request");
                 }
             }
-            SessionEvent::ShutdownRequested => {
-                // TODO: revisit logout & shutdown flows once logout timeouts are implemented
-                self.logout_and_terminate("shutdown requested").await;
-                self.state = SessionState::new_disconnected(false, "shutdown requested");
+            AdminRequest::ResetSequenceNumbersOnNextLogon => {
+                self.reset_on_next_logon = true;
             }
         }
     }
@@ -886,21 +902,36 @@ impl<A: Application<M>, M: FixMessage, S: MessageStore> Session<A, M, S> {
     }
 }
 
-async fn run_session<A, M, S>(mut session: Session<A, M, S>)
-where
+async fn run_session<A, M, S>(
+    mut session: Session<A, M, S>,
+    mut event_receiver: mpsc::Receiver<SessionEvent>,
+    mut outbound_message_receiver: mpsc::Receiver<M>,
+    mut admin_request_receiver: mpsc::Receiver<AdminRequest>,
+) where
     A: Application<M>,
     M: FixMessage,
     S: MessageStore + Send + 'static,
 {
     loop {
-        let next_message = session.mailbox.recv();
-
         select! {
-            next = next_message => {
-                match next {
-                    Some(msg) => {
-                        session.handle(msg).await
+            biased;
+            next_admin_request = admin_request_receiver.recv() => {
+                match next_admin_request {
+                    Some(request) => session.handle_admin_request(request).await,
+                    None => break,
+                }
+            }
+            next_event = event_receiver.recv()=> {
+                match next_event {
+                    Some(event) => {
+                        session.handle_session_event(event).await
                     }
+                    None => break,
+                }
+            }
+            next_outbound_message = outbound_message_receiver.recv() => {
+                match next_outbound_message {
+                    Some(message) => session.handle_outbound_message(message).await,
                     None => break,
                 }
             }

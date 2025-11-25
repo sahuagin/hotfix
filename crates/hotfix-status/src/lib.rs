@@ -9,15 +9,15 @@ use crate::api::build_api_router;
 use crate::data_provider::{DataProvider, SessionDataProvider};
 use axum::Router;
 use hotfix::message::FixMessage;
-use hotfix::session::SessionRef;
+use hotfix::session::SessionHandle;
 
 #[derive(Clone)]
 struct AppState<P> {
     data_provider: P,
 }
 
-pub fn build_router<M: FixMessage>(session_ref: SessionRef<M>) -> Router {
-    let data_provider = SessionDataProvider { session_ref };
+pub fn build_router<M: FixMessage>(session_handle: SessionHandle<M>) -> Router {
+    let data_provider = SessionDataProvider { session_handle };
     build_router_with_provider(data_provider)
 }
 
@@ -55,8 +55,8 @@ mod tests {
 
     #[async_trait::async_trait]
     impl DataProvider for FakeDataProvider {
-        async fn get_session_info(&self) -> SessionInfo {
-            self.session_info.clone()
+        async fn get_session_info(&self) -> anyhow::Result<SessionInfo> {
+            Ok(self.session_info.clone())
         }
     }
 

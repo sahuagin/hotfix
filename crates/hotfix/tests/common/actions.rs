@@ -1,7 +1,6 @@
 use crate::common::fakes::{FakeCounterparty, SessionSpy};
 use crate::common::test_messages::TestMessage;
 use hotfix::message::FixMessage;
-use hotfix::session::SessionRef;
 use std::time::Duration;
 
 pub struct When<T> {
@@ -13,18 +12,16 @@ pub fn when<T>(target: T) -> When<T> {
 }
 
 impl When<&SessionSpy> {
-    fn session(&self) -> &SessionRef<TestMessage> {
-        self.target.session_ref()
-    }
-
     pub async fn requests_disconnect(self) {
-        self.session()
-            .disconnect("Test Session Finished".to_string())
-            .await;
+        self.target.session_handle().shutdown(false).await;
     }
 
     pub async fn sends_message(self, message: TestMessage) {
-        self.session().send_message(message).await;
+        self.target
+            .session_handle()
+            .send_message(message)
+            .await
+            .expect("message to be sent successfully");
     }
 }
 
@@ -55,6 +52,10 @@ impl When<&mut FakeCounterparty<TestMessage>> {
 
     pub async fn sends_logon(&mut self) {
         self.target.send_logon().await;
+    }
+
+    pub async fn gets_reconnected(&mut self, reset_store: bool) {
+        self.target.reconnect(reset_store).await;
     }
 }
 
