@@ -1366,8 +1366,25 @@ dependencies = [
 ]
 
 [[package]]
-name = "hotfix-status"
-version = "0.1.15"
+name = "hotfix-web"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum",
+ "displaydoc",
+ "hotfix",
+ "hotfix-web-ui",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.12",
+ "tokio",
+ "tower",
+]
+
+[[package]]
+name = "hotfix-web-ui"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "askama",
@@ -1378,8 +1395,6 @@ dependencies = [
  "hotfix",
  "mime_guess",
  "rust-embed",
- "serde",
- "serde_json",
  "thiserror 2.0.12",
  "tokio",
  "tower",
@@ -3129,7 +3144,7 @@ dependencies = [
  "axum",
  "clap",
  "hotfix",
- "hotfix-status",
+ "hotfix-web",
  "tokio",
  "tokio-util",
  "tracing",
