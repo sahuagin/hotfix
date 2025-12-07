@@ -24,7 +24,11 @@ pub enum SessionState {
     /// We are awaiting the target to resend the gap we have.
     AwaitingResend(AwaitingResendState),
     /// We are in the process of gracefully logging out
-    AwaitingLogout { writer: WriterRef }, // we need the writer so we can disconnect it on successful logout
+    AwaitingLogout {
+        writer: WriterRef, // we need the writer so we can disconnect it on successful logout
+        logout_timeout: Instant,
+        reconnect: bool, // we carry this forward for the subsequent disconnected state
+    },
     /// The session is active, we have connected and mutually logged on.
     Active(ActiveState),
     /// The TCP connection has been dropped.
@@ -87,7 +91,7 @@ impl SessionState {
                     _ => error!("invalid outgoing message for AwaitingLogon state"),
                 }
             }
-            Self::AwaitingLogout { writer } => {
+            Self::AwaitingLogout { writer, .. } => {
                 // Logout messages are allowed because we first transition into AwaitingLogout
                 // and only then send the logout message
                 if message_type == b"5" {
@@ -102,7 +106,7 @@ impl SessionState {
         match self {
             Self::Active(ActiveState { writer, .. })
             | Self::AwaitingLogon { writer, .. }
-            | Self::AwaitingLogout { writer }
+            | Self::AwaitingLogout { writer, .. }
             | Self::AwaitingResend(AwaitingResendState { writer, .. }) => writer.disconnect().await,
             _ => debug!("disconnecting an already disconnected session"),
         }
@@ -112,13 +116,17 @@ impl SessionState {
         match self {
             Self::Active(ActiveState { writer, .. })
             | Self::AwaitingLogon { writer, .. }
-            | Self::AwaitingLogout { writer }
+            | Self::AwaitingLogout { writer, .. }
             | Self::AwaitingResend(AwaitingResendState { writer, .. }) => Some(writer),
             _ => None,
         }
     }
 
-    pub fn try_transition_to_awaiting_logout(&mut self) -> bool {
+    pub fn try_transition_to_awaiting_logout(
+        &mut self,
+        logout_timeout: Duration,
+        reconnect: bool,
+    ) -> bool {
         if matches!(self, SessionState::AwaitingLogout { .. }) {
             debug!("already in awaiting logout state");
             return false;
@@ -127,6 +135,8 @@ impl SessionState {
         if let Some(writer) = self.get_writer() {
             *self = SessionState::AwaitingLogout {
                 writer: writer.clone(),
+                logout_timeout: Instant::now() + logout_timeout,
+                reconnect,
             };
             true
         } else {
@@ -220,6 +230,7 @@ impl SessionState {
         match self {
             Self::Active(ActiveState { peer_deadline, .. }) => Some(peer_deadline),
             Self::AwaitingLogon { logon_timeout, .. } => Some(logon_timeout),
+            Self::AwaitingLogout { logout_timeout, .. } => Some(logout_timeout),
             _ => None,
         }
     }
@@ -266,6 +277,10 @@ impl SessionState {
 
     pub fn is_awaiting_logon(&self) -> bool {
         matches!(self, SessionState::AwaitingLogon { .. })
+    }
+
+    pub fn is_awaiting_logout(&self) -> bool {
+        matches!(self, SessionState::AwaitingLogout { .. })
     }
 
     pub fn as_status(&self) -> SessionInfoStatus {
@@ -427,6 +442,8 @@ mod tests {
     fn test_awaiting_resend_transition_when_awaiting_logout_is_prevented() {
         let mut state = SessionState::AwaitingLogout {
             writer: create_writer_ref(),
+            logout_timeout: Instant::now(),
+            reconnect: false,
         };
 
         let result = state.try_transition_to_awaiting_resend(1, 5);

@@ -293,11 +293,8 @@ impl<A: Application<M>, M: FixMessage, S: MessageStore> Session<A, M, S> {
             SessionState::Disconnected { .. } => {
                 warn!("disconnect message was received, but the session is already disconnected")
             }
-            SessionState::AwaitingLogout { .. } => {
-                // this is unexpected because the other side should send a logout before disconnecting,
-                // which would move this session out of the ShuttingDown state
-                // TODO: is this actually true? need to review the spec carefully
-                warn!("disconnect message was received, but the session is still shutting down")
+            SessionState::AwaitingLogout { reconnect, .. } => {
+                self.state = SessionState::new_disconnected(reconnect, &reason);
             }
         }
     }
@@ -782,8 +779,11 @@ impl<A: Application<M>, M: FixMessage, S: MessageStore> Session<A, M, S> {
         self.state.disconnect_writer().await;
     }
 
-    async fn initiate_graceful_logout(&mut self, reason: &str) {
-        if self.state.try_transition_to_awaiting_logout() {
+    async fn initiate_graceful_logout(&mut self, reason: &str, reconnect: bool) {
+        if self.state.try_transition_to_awaiting_logout(
+            Duration::from_secs(self.config.logout_timeout),
+            reconnect,
+        ) {
             self.send_logout(reason).await;
         }
     }
@@ -826,8 +826,8 @@ impl<A: Application<M>, M: FixMessage, S: MessageStore> Session<A, M, S> {
         match request {
             AdminRequest::InitiateGracefulShutdown { reconnect } => {
                 warn!("initiating shutdown on request from admin..");
-                self.logout_and_terminate("shutdown requested").await;
-                self.state = SessionState::new_disconnected(reconnect, "shutdown requested");
+                self.initiate_graceful_logout("explicitly requested", reconnect)
+                    .await;
             }
             AdminRequest::RequestSessionInfo(responder) => {
                 info!("session info requested");
@@ -852,6 +852,9 @@ impl<A: Application<M>, M: FixMessage, S: MessageStore> Session<A, M, S> {
             self.logout_and_terminate("peer timeout").await;
         } else if self.state.is_awaiting_logon() {
             warn!("peer didn't respond to our Logon, disconnecting..");
+            self.state.disconnect_writer().await;
+        } else if self.state.is_awaiting_logout() {
+            warn!("peer didn't respond to our Logout, disconnecting..");
             self.state.disconnect_writer().await;
         } else {
             let req_id = format!("TEST_{}", self.store.next_target_seq_number());
@@ -892,7 +895,8 @@ impl<A: Application<M>, M: FixMessage, S: MessageStore> Session<A, M, S> {
             }
         } else if self.state.is_connected() {
             // we are currently outside scheduled session time
-            self.initiate_graceful_logout("End of session time").await;
+            self.initiate_graceful_logout("End of session time", true)
+                .await;
         }
 
         // we always need to reschedule the check, otherwise we won't be able to resume an inactive session
