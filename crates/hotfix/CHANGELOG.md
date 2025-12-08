@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.1](https://github.com/Validus-Risk-Management/hotfix/compare/hotfix-v0.4.0...hotfix-v0.4.1) - 2025-12-08
+
+### Added
+
+- support non-gap-fill sequence resets ([#255](https://github.com/Validus-Risk-Management/hotfix/pull/255))
+
 ## [0.4.0](https://github.com/Validus-Risk-Management/hotfix/compare/hotfix-v0.3.2...hotfix-v0.4.0) - 2025-12-08
 
 ### Added
