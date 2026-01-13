@@ -18,11 +18,13 @@ pub mod verification;
 pub use parser::RawFixMessage;
 pub use resend_request::ResendRequest;
 
-pub trait FixMessage: Clone + Send + 'static {
+pub trait OutboundMessage: Clone + Send + 'static {
     fn write(&self, msg: &mut Message);
 
     fn message_type(&self) -> &str;
+}
 
+pub trait InboundMessage: Clone + Send + 'static {
     fn parse(message: &Message) -> Self;
 }
 
@@ -31,7 +33,7 @@ pub fn generate_message(
     sender_comp_id: &str,
     target_comp_id: &str,
     msg_seq_num: u64,
-    message: impl FixMessage,
+    message: impl OutboundMessage,
 ) -> Result<Vec<u8>, EncodeError> {
     let mut msg = Message::new(begin_string, message.message_type());
     msg.set(SENDER_COMP_ID, sender_comp_id);
@@ -42,10 +44,4 @@ pub fn generate_message(
     message.write(&mut msg);
 
     msg.encode(&Config::default())
-}
-
-pub trait WriteMessage {
-    fn write(&self, msg: &mut Message);
-
-    fn message_type(&self) -> &str;
 }
