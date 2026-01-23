@@ -1,4 +1,5 @@
 pub(crate) mod admin_request;
+pub mod error;
 pub(crate) mod event;
 mod info;
 mod session_handle;
@@ -26,15 +27,17 @@ use tracing::{debug, enabled, error, info, warn};
 
 use crate::Application;
 use crate::application::{InboundDecision, OutboundDecision};
-use crate::error::{CompIdType, MessageVerificationError};
 use crate::message::logout::Logout;
 use crate::message::reject::Reject;
 use crate::message::resend_request::ResendRequest;
 use crate::message::sequence_reset::SequenceReset;
 use crate::message::test_request::TestRequest;
 use crate::message::verification::verify_message;
+use crate::message::verification_error::{CompIdType, MessageVerificationError};
 use crate::message_utils::{is_admin, prepare_message_for_resend};
 use crate::session::admin_request::AdminRequest;
+pub use crate::session::info::{SessionInfo, Status};
+pub use crate::session::session_handle::SessionHandle;
 #[cfg(not(feature = "test-utils"))]
 pub(crate) use crate::session::session_ref::InternalSessionRef;
 #[cfg(feature = "test-utils")]
@@ -48,9 +51,6 @@ use hotfix_message::session_fields::{
     BEGIN_SEQ_NO, END_SEQ_NO, GAP_FILL_FLAG, MSG_SEQ_NUM, MSG_TYPE, NEW_SEQ_NO,
     SessionRejectReason, TEST_REQ_ID,
 };
-
-pub use crate::session::info::{SessionInfo, Status};
-pub use crate::session::session_handle::SessionHandle;
 
 const SCHEDULE_CHECK_INTERVAL: u64 = 1;
 
@@ -365,7 +365,8 @@ where
             }
         }
 
-        self.store.increment_target_seq_number().await
+        self.store.increment_target_seq_number().await?;
+        Ok(())
     }
 
     async fn on_heartbeat(&mut self, message: &Message) -> Result<()> {
@@ -378,7 +379,8 @@ where
             self.reset_peer_timer(None);
         }
 
-        self.store.increment_target_seq_number().await
+        self.store.increment_target_seq_number().await?;
+        Ok(())
     }
 
     async fn on_test_request(&mut self, message: &Message) -> Result<()> {
@@ -515,7 +517,8 @@ where
             return Ok(());
         }
 
-        self.store.set_target_seq_number(end - 1).await
+        self.store.set_target_seq_number(end - 1).await?;
+        Ok(())
     }
 
     async fn handle_verification_error(&mut self, error: MessageVerificationError) -> Result<()> {
@@ -1129,6 +1132,7 @@ mod tests {
     use super::*;
     use crate::application::{InboundDecision, OutboundDecision};
     use crate::message::{InboundMessage, OutboundMessage};
+    use crate::store::{Result as StoreResult, StoreError};
     use chrono::{DateTime, Datelike, NaiveDate, NaiveTime, TimeDelta, Timelike};
     use chrono_tz::Tz;
     use hotfix_message::message::Message;
@@ -1168,11 +1172,11 @@ mod tests {
 
     #[async_trait::async_trait]
     impl MessageStore for TestStore {
-        async fn add(&mut self, _sequence_number: u64, _message: &[u8]) -> Result<()> {
+        async fn add(&mut self, _sequence_number: u64, _message: &[u8]) -> StoreResult<()> {
             Ok(())
         }
 
-        async fn get_slice(&self, _begin: usize, _end: usize) -> Result<Vec<Vec<u8>>> {
+        async fn get_slice(&self, _begin: usize, _end: usize) -> StoreResult<Vec<Vec<u8>>> {
             Ok(vec![])
         }
 
@@ -1184,25 +1188,25 @@ mod tests {
             self.target_seq
         }
 
-        async fn increment_sender_seq_number(&mut self) -> Result<()> {
+        async fn increment_sender_seq_number(&mut self) -> StoreResult<()> {
             self.sender_seq += 1;
             Ok(())
         }
 
-        async fn increment_target_seq_number(&mut self) -> Result<()> {
+        async fn increment_target_seq_number(&mut self) -> StoreResult<()> {
             self.target_seq += 1;
             Ok(())
         }
 
-        async fn set_target_seq_number(&mut self, seq_number: u64) -> Result<()> {
+        async fn set_target_seq_number(&mut self, seq_number: u64) -> StoreResult<()> {
             self.target_seq = seq_number;
             Ok(())
         }
 
-        async fn reset(&mut self) -> Result<()> {
+        async fn reset(&mut self) -> StoreResult<()> {
             self.reset_called.store(true, Ordering::SeqCst);
             if self.fail_reset.load(Ordering::SeqCst) {
-                bail!("simulated reset failure")
+                return Err(StoreError::Reset("simulated reset failure".into()));
             }
             self.creation_time = Utc::now();
             Ok(())

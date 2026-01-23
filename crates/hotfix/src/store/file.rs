@@ -1,5 +1,5 @@
-use crate::store::MessageStore;
-use anyhow::{Context, Result};
+use crate::store::{MessageStore, Result, StoreError};
+use anyhow::Context;
 use chrono::{DateTime, Utc};
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
@@ -33,7 +33,7 @@ pub struct FileStore {
 }
 
 impl FileStore {
-    pub fn new(directory: impl AsRef<Path>, name: &str) -> Result<Self> {
+    pub fn new(directory: impl AsRef<Path>, name: &str) -> anyhow::Result<Self> {
         let base_path = directory.as_ref().join(name);
         std::fs::create_dir_all(directory)?;
 
@@ -84,7 +84,7 @@ impl FileStore {
     /// Retrieves the session creation time from the session file.
     ///
     /// It initialises the session file if it doesn't exist.
-    fn get_or_create_session_time(base_path: &Path) -> Result<DateTime<Utc>> {
+    fn get_or_create_session_time(base_path: &Path) -> anyhow::Result<DateTime<Utc>> {
         let session_path = base_path.with_extension("session");
         let session_time = if session_path.exists() {
             let content = std::fs::read_to_string(&session_path)?;
@@ -101,7 +101,7 @@ impl FileStore {
     /// Retrieves the sequence numbers from the seqnums file.
     ///
     /// It defaults to `(0, 0)` if the file doesn't exist or if it's empty.
-    fn read_initial_seqnums(base_path: &Path) -> Result<(u64, u64)> {
+    fn read_initial_seqnums(base_path: &Path) -> anyhow::Result<(u64, u64)> {
         let seqnums_path = base_path.with_extension("seqnums");
         let (sender_seq_number, target_seq_number) = if seqnums_path.exists() {
             let content =
@@ -118,7 +118,7 @@ impl FileStore {
         Ok((sender_seq_number, target_seq_number))
     }
 
-    fn parse_seqnums(content: &str) -> Result<(u64, u64)> {
+    fn parse_seqnums(content: &str) -> anyhow::Result<(u64, u64)> {
         let parts: Vec<&str> = content.trim().split(':').map(|s| s.trim()).collect();
         if parts.len() != 2 {
             anyhow::bail!("invalid seqnums format");
@@ -132,7 +132,7 @@ impl FileStore {
         Ok((sender, target))
     }
 
-    fn load_message_index(header_path: &Path) -> Result<HashMap<u64, MessageDef>> {
+    fn load_message_index(header_path: &Path) -> anyhow::Result<HashMap<u64, MessageDef>> {
         let mut index = HashMap::new();
 
         if !header_path.exists() {
@@ -161,22 +161,15 @@ impl FileStore {
         Ok(index)
     }
 
-    fn write_seqnums(&mut self) -> Result<()> {
+    fn write_seqnums_with(&mut self, sender: u64, target: u64) -> std::io::Result<()> {
         self.seqnums_file.seek(SeekFrom::Start(0))?;
         self.seqnums_file.set_len(0)?;
-        write!(
-            self.seqnums_file,
-            "{:020} : {:020}",
-            self.sender_seq_number, self.target_seq_number
-        )?;
+        write!(self.seqnums_file, "{:020} : {:020}", sender, target)?;
         self.seqnums_file.flush()?;
         Ok(())
     }
-}
 
-#[async_trait::async_trait]
-impl MessageStore for FileStore {
-    async fn add(&mut self, sequence_number: u64, message: &[u8]) -> anyhow::Result<()> {
+    fn write_message(&mut self, sequence_number: u64, message: &[u8]) -> std::io::Result<()> {
         let msg_size = message.len();
         let offset = self.current_body_offset;
 
@@ -204,58 +197,7 @@ impl MessageStore for FileStore {
         Ok(())
     }
 
-    async fn get_slice(&self, begin: usize, end: usize) -> Result<Vec<Vec<u8>>> {
-        let mut messages = Vec::with_capacity(end - begin + 1);
-
-        let body_path = self.base_path.with_extension("body");
-        let mut body_file =
-            File::open(body_path).context("failed to open body file for reading")?;
-
-        for seq_num in begin..=end {
-            if let Some(msg_def) = self.message_index.get(&(seq_num as u64)) {
-                body_file.seek(SeekFrom::Start(msg_def.offset))?;
-
-                let mut buffer = vec![0u8; msg_def.size];
-                body_file
-                    .read_exact(&mut buffer)
-                    .context("failed to read message from body file")?;
-
-                messages.push(buffer);
-            }
-        }
-
-        Ok(messages)
-    }
-
-    fn next_sender_seq_number(&self) -> u64 {
-        self.sender_seq_number + 1
-    }
-
-    fn next_target_seq_number(&self) -> u64 {
-        self.target_seq_number + 1
-    }
-
-    async fn increment_sender_seq_number(&mut self) -> Result<()> {
-        self.sender_seq_number += 1;
-        self.write_seqnums()?;
-
-        Ok(())
-    }
-
-    async fn increment_target_seq_number(&mut self) -> Result<()> {
-        self.target_seq_number += 1;
-        self.write_seqnums()?;
-
-        Ok(())
-    }
-
-    async fn set_target_seq_number(&mut self, seq_number: u64) -> Result<()> {
-        self.target_seq_number = seq_number;
-        self.write_seqnums()?;
-        Ok(())
-    }
-
-    async fn reset(&mut self) -> Result<()> {
+    fn perform_reset(&mut self) -> std::io::Result<()> {
         self.body_file.flush()?;
         self.header_file.flush()?;
 
@@ -311,6 +253,82 @@ impl MessageStore for FileStore {
         self.creation_time = now;
 
         Ok(())
+    }
+
+    fn read_messages(&self, begin: usize, end: usize) -> std::io::Result<Vec<Vec<u8>>> {
+        let mut messages = Vec::with_capacity(end - begin + 1);
+
+        let body_path = self.base_path.with_extension("body");
+        let mut body_file = File::open(body_path)?;
+
+        for seq_num in begin..=end {
+            if let Some(msg_def) = self.message_index.get(&(seq_num as u64)) {
+                body_file.seek(SeekFrom::Start(msg_def.offset))?;
+
+                let mut buffer = vec![0u8; msg_def.size];
+                body_file.read_exact(&mut buffer)?;
+
+                messages.push(buffer);
+            }
+        }
+
+        Ok(messages)
+    }
+}
+
+#[async_trait::async_trait]
+impl MessageStore for FileStore {
+    async fn add(&mut self, sequence_number: u64, message: &[u8]) -> Result<()> {
+        self.write_message(sequence_number, message)
+            .map_err(|err| StoreError::PersistMessage {
+                sequence_number,
+                source: err.into(),
+            })
+    }
+
+    async fn get_slice(&self, begin: usize, end: usize) -> Result<Vec<Vec<u8>>> {
+        self.read_messages(begin, end)
+            .map_err(|e| StoreError::RetrieveMessages {
+                begin,
+                end,
+                source: e.into(),
+            })
+    }
+
+    fn next_sender_seq_number(&self) -> u64 {
+        self.sender_seq_number + 1
+    }
+
+    fn next_target_seq_number(&self) -> u64 {
+        self.target_seq_number + 1
+    }
+
+    async fn increment_sender_seq_number(&mut self) -> Result<()> {
+        let new_value = self.sender_seq_number + 1;
+        self.write_seqnums_with(new_value, self.target_seq_number)
+            .map_err(|e| StoreError::UpdateSequenceNumber(e.into()))?;
+        self.sender_seq_number = new_value;
+        Ok(())
+    }
+
+    async fn increment_target_seq_number(&mut self) -> Result<()> {
+        let new_value = self.target_seq_number + 1;
+        self.write_seqnums_with(self.sender_seq_number, new_value)
+            .map_err(|e| StoreError::UpdateSequenceNumber(e.into()))?;
+        self.target_seq_number = new_value;
+        Ok(())
+    }
+
+    async fn set_target_seq_number(&mut self, seq_number: u64) -> Result<()> {
+        self.write_seqnums_with(self.sender_seq_number, seq_number)
+            .map_err(|e| StoreError::UpdateSequenceNumber(e.into()))?;
+        self.target_seq_number = seq_number;
+        Ok(())
+    }
+
+    async fn reset(&mut self) -> Result<()> {
+        self.perform_reset()
+            .map_err(|e| StoreError::Reset(e.into()))
     }
 
     fn creation_time(&self) -> DateTime<Utc> {

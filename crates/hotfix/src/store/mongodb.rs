@@ -1,4 +1,3 @@
-use anyhow::Result;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use futures::TryStreamExt;
@@ -12,7 +11,7 @@ use serde::{Deserialize, Serialize};
 
 pub use mongodb::Client;
 
-use crate::store::MessageStore;
+use crate::store::{MessageStore, Result, StoreError};
 
 #[derive(Debug, Deserialize, Serialize)]
 struct SequenceMeta {
@@ -38,7 +37,7 @@ pub struct MongoDbMessageStore {
 }
 
 impl MongoDbMessageStore {
-    pub async fn new(db: Database, collection_name: Option<&str>) -> Result<Self> {
+    pub async fn new(db: Database, collection_name: Option<&str>) -> anyhow::Result<Self> {
         let collection_name = collection_name.unwrap_or("messages");
         let meta_collection = db.collection(collection_name);
         let message_collection = db.collection(collection_name);
@@ -54,7 +53,7 @@ impl MongoDbMessageStore {
         Ok(store)
     }
 
-    async fn ensure_indexes(meta_collection: &Collection<SequenceMeta>) -> Result<()> {
+    async fn ensure_indexes(meta_collection: &Collection<SequenceMeta>) -> anyhow::Result<()> {
         let meta_index = IndexModel::builder()
             .keys(doc! { "meta": 1, "_id": -1 })
             .build();
@@ -72,7 +71,7 @@ impl MongoDbMessageStore {
 
     async fn get_or_default_sequence(
         meta_collection: &Collection<SequenceMeta>,
-    ) -> Result<SequenceMeta> {
+    ) -> anyhow::Result<SequenceMeta> {
         let options = FindOneOptions::builder().sort(doc! { "_id": -1 }).build();
         let res = meta_collection
             .find_one(doc! { "meta": true })
@@ -86,7 +85,9 @@ impl MongoDbMessageStore {
         Ok(meta)
     }
 
-    async fn new_sequence(meta_collection: &Collection<SequenceMeta>) -> Result<SequenceMeta> {
+    async fn new_sequence(
+        meta_collection: &Collection<SequenceMeta>,
+    ) -> anyhow::Result<SequenceMeta> {
         let sequence_id = ObjectId::new();
         let initial_meta = SequenceMeta {
             object_id: sequence_id,
@@ -112,12 +113,16 @@ impl MessageStore for MongoDbMessageStore {
                 bytes: message.to_vec(),
             },
         };
-        let filter = doc! { "sequence_id": self.current_sequence.object_id, "msg_seq_number": sequence_number as u32 };
+        let filter = doc! { "sequence_id": self.current_sequence.object_id, "msg_seq_number": sequence_number as i64 };
         let options = ReplaceOptions::builder().upsert(true).build();
         self.message_collection
             .replace_one(filter, message)
             .with_options(options)
-            .await?;
+            .await
+            .map_err(|e| StoreError::PersistMessage {
+                sequence_number,
+                source: e.into(),
+            })?;
 
         Ok(())
     }
@@ -126,14 +131,29 @@ impl MessageStore for MongoDbMessageStore {
         let filter = doc! {
             "sequence_id": self.current_sequence.object_id,
             "msg_seq_number": doc! {
-                "$gte": begin as u32,
-                "$lte": end as u32,
+                "$gte": begin as i64,
+                "$lte": end as i64,
             }
         };
-        let mut cursor = self.message_collection.find(filter).await?;
+        let mut cursor = self.message_collection.find(filter).await.map_err(|e| {
+            StoreError::RetrieveMessages {
+                begin,
+                end,
+                source: e.into(),
+            }
+        })?;
 
         let mut messages = Vec::new();
-        while let Some(message) = cursor.try_next().await? {
+        while let Some(message) =
+            cursor
+                .try_next()
+                .await
+                .map_err(|e| StoreError::RetrieveMessages {
+                    begin,
+                    end,
+                    source: e.into(),
+                })?
+        {
             messages.push(message.data.bytes);
         }
 
@@ -149,43 +169,48 @@ impl MessageStore for MongoDbMessageStore {
     }
 
     async fn increment_sender_seq_number(&mut self) -> Result<()> {
-        self.current_sequence.sender_seq_number += 1;
         self.meta_collection
             .update_one(
                 doc! { "_id": self.current_sequence.object_id },
                 doc! { "$inc": { "sender_seq_number": 1 } },
             )
-            .await?;
+            .await
+            .map_err(|e| StoreError::UpdateSequenceNumber(e.into()))?;
+        self.current_sequence.sender_seq_number += 1;
 
         Ok(())
     }
 
     async fn increment_target_seq_number(&mut self) -> Result<()> {
-        self.current_sequence.target_seq_number += 1;
         self.meta_collection
             .update_one(
                 doc! { "_id": self.current_sequence.object_id },
                 doc! { "$inc": { "target_seq_number": 1 } },
             )
-            .await?;
+            .await
+            .map_err(|e| StoreError::UpdateSequenceNumber(e.into()))?;
+        self.current_sequence.target_seq_number += 1;
 
         Ok(())
     }
 
     async fn set_target_seq_number(&mut self, seq_number: u64) -> Result<()> {
-        self.current_sequence.target_seq_number = seq_number;
         self.meta_collection
             .update_one(
                 doc! { "_id": self.current_sequence.object_id },
-                doc! { "$set": { "target_seq_number": seq_number as u32 } },
+                doc! { "$set": { "target_seq_number": seq_number as i64 } },
             )
-            .await?;
+            .await
+            .map_err(|e| StoreError::UpdateSequenceNumber(e.into()))?;
+        self.current_sequence.target_seq_number = seq_number;
 
         Ok(())
     }
 
     async fn reset(&mut self) -> Result<()> {
-        self.current_sequence = Self::new_sequence(&self.meta_collection).await?;
+        self.current_sequence = Self::new_sequence(&self.meta_collection)
+            .await
+            .map_err(|e| StoreError::Reset(e.into()))?;
         Ok(())
     }
 

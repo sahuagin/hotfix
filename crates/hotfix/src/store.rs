@@ -3,6 +3,9 @@
 //! By default, only the [in_memory] store is included. Further message store implementations,
 //! such as `mongodb` and `redb` can be enabled through feature flags.
 
+/// Error types for store operations.
+pub mod error;
+
 /// An in-memory message store that loses its state on restart. Only use this for testing.
 pub mod in_memory;
 
@@ -12,11 +15,9 @@ pub mod mongodb;
 
 /// A file-based message store for persistence.
 pub mod file;
-#[cfg(feature = "redb")]
-/// A message store using [redb](https://www.redb.org/) for persistence.
-pub mod redb;
 
-use anyhow::Result;
+pub use error::*;
+
 use chrono::DateTime;
 
 #[async_trait::async_trait]

@@ -1,5 +1,5 @@
 use crate::config::ScheduleConfig;
-use crate::error::SessionError;
+use crate::session::error::SessionError;
 use chrono::{DateTime, Datelike, Days, NaiveDate, NaiveTime, TimeDelta, Utc, Weekday};
 use chrono_tz::Tz;
 
@@ -1043,6 +1043,7 @@ mod tests {
             SessionError::InvalidSchedule(msg) => {
                 assert!(msg.contains("Weekly sessions cannot have weekdays specified"));
             }
+            other => panic!("unexpected error: {other}"),
         }
     }
 
