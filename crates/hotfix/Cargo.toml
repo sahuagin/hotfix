@@ -22,8 +22,8 @@ workspace = true
 
 [dependencies]
 hotfix-message = { version = "0.3.0", path = "../hotfix-message", features = ["utils-chrono"] }
-hotfix-store = { version = "0.1.0", path = "../hotfix-store" }
-hotfix-store-mongodb = { version = "0.1.0", path = "../hotfix-store-mongodb", optional = true }
+hotfix-store = { version = "0.1.1", path = "../hotfix-store" }
+hotfix-store-mongodb = { version = "0.1.1", path = "../hotfix-store-mongodb", optional = true }
 
 anyhow = { workspace = true }
 async-trait = { workspace = true }
