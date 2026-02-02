@@ -36,12 +36,14 @@ use crate::message::verification::verify_message;
 use crate::message::verification_error::{CompIdType, MessageVerificationError};
 use crate::message_utils::{is_admin, prepare_message_for_resend};
 use crate::session::admin_request::AdminRequest;
+pub use crate::session::error::{SendError, SendOutcome};
 pub use crate::session::info::{SessionInfo, Status};
 pub use crate::session::session_handle::SessionHandle;
 #[cfg(not(feature = "test-utils"))]
 pub(crate) use crate::session::session_ref::InternalSessionRef;
 #[cfg(feature = "test-utils")]
 pub use crate::session::session_ref::InternalSessionRef;
+use crate::session::session_ref::OutboundRequest;
 use crate::session::state::SessionState;
 use crate::session::state::{AwaitingResendTransitionOutcome, TestRequestId};
 use crate::session_schedule::SessionSchedule;
@@ -800,26 +802,29 @@ where
             .reset_peer_timer(self.config.heartbeat_interval, test_request_id);
     }
 
-    async fn send_app_message(&mut self, message: Outbound) -> Result<()> {
+    async fn send_app_message(&mut self, message: Outbound) -> Result<SendOutcome, SendError> {
+        if !self.state.is_connected() {
+            return Err(SendError::Disconnected);
+        }
+
         match self.application.on_outbound_message(&message).await {
             OutboundDecision::Send => {
-                self.send_message(message)
-                    .await
-                    .context("failed to send app message")?;
+                let sequence_number = self.send_message(message).await?;
+                Ok(SendOutcome::Sent { sequence_number })
             }
             OutboundDecision::Drop => {
                 debug!("dropped outbound message as instructed by the application");
+                Ok(SendOutcome::Dropped)
             }
             OutboundDecision::TerminateSession => {
                 warn!("the application indicated we should terminate the session");
                 self.state.disconnect_writer().await;
+                Err(SendError::SessionTerminated)
             }
         }
-
-        Ok(())
     }
 
-    async fn send_message(&mut self, message: impl OutboundMessage) -> Result<()> {
+    async fn send_message(&mut self, message: impl OutboundMessage) -> Result<u64, SendError> {
         let seq_num = self.store.next_sender_seq_number();
         let msg_type = message.message_type().as_bytes().to_vec();
         let msg = generate_message(
@@ -829,19 +834,26 @@ where
             seq_num,
             message,
         )
-        .context("failed to generate message")?;
+        .map_err(|e| {
+            SendError::Persist(crate::store::StoreError::PersistMessage {
+                sequence_number: seq_num,
+                source: e.into(),
+            })
+        })?;
+
         self.store
             .increment_sender_seq_number()
             .await
-            .context("failed to increment sender seq number")?;
+            .map_err(SendError::SequenceNumber)?;
 
         self.store
             .add(seq_num, &msg)
             .await
-            .context("failed to add message to store")?;
+            .map_err(SendError::Persist)?;
+
         self.send_raw(&msg_type, msg).await;
 
-        Ok(())
+        Ok(seq_num)
     }
 
     async fn send_raw(&mut self, message_type: &[u8], data: Vec<u8>) {
@@ -873,7 +885,8 @@ where
 
     async fn send_resend_request(&mut self, begin: u64, end: u64) -> Result<()> {
         let request = ResendRequest::new(begin, end);
-        self.send_message(request).await
+        self.send_message(request).await.map(|_| ())?;
+        Ok(())
     }
 
     async fn send_logon(&mut self) -> Result<()> {
@@ -887,12 +900,14 @@ where
 
         let logon = Logon::new(self.config.heartbeat_interval, reset_config);
 
-        self.send_message(logon).await
+        self.send_message(logon).await.map(|_| ())?;
+        Ok(())
     }
 
     async fn send_logout(&mut self, reason: &str) -> Result<()> {
         let logout = Logout::with_reason(reason.to_string());
-        self.send_message(logout).await
+        self.send_message(logout).await.map(|_| ())?;
+        Ok(())
     }
 
     /// Sends a logout message and immediately disconnects the counterparty.
@@ -957,9 +972,19 @@ where
         }
     }
 
-    async fn handle_outbound_message(&mut self, message: Outbound) {
-        if let Err(err) = self.send_app_message(message).await {
-            error!(err = ?err, "failed to send app message: {err}");
+    async fn handle_outbound_message(&mut self, request: OutboundRequest<Outbound>) {
+        let OutboundRequest { message, confirm } = request;
+        let result = self.send_app_message(message).await;
+        match confirm {
+            Some(tx) => {
+                // Ignore send errors - receiver may have been dropped
+                let _ = tx.send(result);
+            }
+            None => {
+                if let Err(err) = result {
+                    error!(err = ?err, "failed to send app message: {err}");
+                }
+            }
         }
     }
 
@@ -1069,7 +1094,7 @@ where
 async fn run_session<App, Inbound, Outbound, Store>(
     mut session: Session<App, Inbound, Outbound, Store>,
     mut event_receiver: mpsc::Receiver<SessionEvent>,
-    mut outbound_message_receiver: mpsc::Receiver<Outbound>,
+    mut outbound_message_receiver: mpsc::Receiver<OutboundRequest<Outbound>>,
     mut admin_request_receiver: mpsc::Receiver<AdminRequest>,
 ) where
     App: Application<Inbound, Outbound>,
@@ -1094,9 +1119,9 @@ async fn run_session<App, Inbound, Outbound, Store>(
                     None => break,
                 }
             }
-            next_outbound_message = outbound_message_receiver.recv() => {
-                match next_outbound_message {
-                    Some(message) => session.handle_outbound_message(message).await,
+            next_outbound_request = outbound_message_receiver.recv() => {
+                match next_outbound_request {
+                    Some(request) => session.handle_outbound_message(request).await,
                     None => break,
                 }
             }
