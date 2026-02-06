@@ -5,6 +5,7 @@ pub(crate) use hotfix_message::message::{Config, Message};
 use hotfix_message::session_fields::{MSG_SEQ_NUM, SENDER_COMP_ID, SENDING_TIME, TARGET_COMP_ID};
 pub use hotfix_message::{Part, RepeatingGroup};
 
+pub mod business_reject;
 pub mod heartbeat;
 pub mod logon;
 pub mod logout;
@@ -23,10 +24,6 @@ pub trait OutboundMessage: Clone + Send + 'static {
     fn write(&self, msg: &mut Message);
 
     fn message_type(&self) -> &str;
-}
-
-pub trait InboundMessage: Clone + Send + 'static {
-    fn parse(message: &Message) -> Self;
 }
 
 pub fn generate_message(

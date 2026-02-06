@@ -20,6 +20,8 @@ use crate::Application;
 use crate::application::{InboundDecision, OutboundDecision};
 use crate::config::SessionConfig;
 use crate::message::OutboundMessage;
+use crate::message::business_reject::BusinessReject;
+use crate::message::generate_message;
 use crate::message::heartbeat::Heartbeat;
 use crate::message::logon::{Logon, ResetSeqNumConfig};
 use crate::message::logout::Logout;
@@ -30,7 +32,6 @@ use crate::message::sequence_reset::SequenceReset;
 use crate::message::test_request::TestRequest;
 use crate::message::verification::verify_message;
 use crate::message::verification_error::{CompIdType, MessageVerificationError};
-use crate::message::{InboundMessage, generate_message};
 use crate::message_utils::{is_admin, prepare_message_for_resend};
 use crate::session::admin_request::AdminRequest;
 use crate::session::error::SessionCreationError;
@@ -57,7 +58,7 @@ use hotfix_message::session_fields::{
 
 const SCHEDULE_CHECK_INTERVAL: u64 = 1;
 
-struct Session<A, I, O, S> {
+struct Session<A, S> {
     message_config: MessageConfig,
     config: SessionConfig,
     schedule: SessionSchedule,
@@ -67,21 +68,18 @@ struct Session<A, I, O, S> {
     store: S,
     schedule_check_timer: Pin<Box<Sleep>>,
     reset_on_next_logon: bool,
-    _phantom: std::marker::PhantomData<fn() -> (I, O)>,
 }
 
-impl<App, Inbound, Outbound, Store> Session<App, Inbound, Outbound, Store>
+impl<App, Store> Session<App, Store>
 where
-    App: Application<Inbound, Outbound>,
-    Inbound: InboundMessage,
-    Outbound: OutboundMessage,
+    App: Application,
     Store: MessageStore,
 {
     fn new(
         config: SessionConfig,
         application: App,
         store: Store,
-    ) -> std::result::Result<Session<App, Inbound, Outbound, Store>, SessionCreationError> {
+    ) -> Result<Session<App, Store>, SessionCreationError> {
         let schedule_check_timer = sleep(Duration::from_secs(SCHEDULE_CHECK_INTERVAL));
 
         let dictionary = Self::get_data_dictionary(&config)?;
@@ -99,7 +97,6 @@ where
             store,
             schedule_check_timer: Box::pin(schedule_check_timer),
             reset_on_next_logon: false,
-            _phantom: std::marker::PhantomData,
         };
 
         Ok(session)
@@ -245,13 +242,26 @@ where
     ) -> Result<(), SessionOperationError> {
         match self.verify_message(message, true) {
             Ok(_) => {
-                let parsed_message = Inbound::parse(message);
-                if matches!(
-                    self.application.on_inbound_message(parsed_message).await,
-                    InboundDecision::TerminateSession
-                ) {
-                    error!("failed to send inbound message to application");
-                    self.state.disconnect_writer().await;
+                match self.application.on_inbound_message(message).await {
+                    InboundDecision::Accept => {}
+                    InboundDecision::Reject { reason, text } => {
+                        let msg_type: &str = message
+                            .header()
+                            .get(MSG_TYPE)
+                            .map_err(|_| SessionOperationError::MissingField("MSG_TYPE"))?;
+                        let mut reject = BusinessReject::new(msg_type, reason)
+                            .ref_seq_num(get_msg_seq_num(message));
+                        if let Some(text) = text {
+                            reject = reject.text(&text);
+                        }
+                        self.send_message(reject)
+                            .await
+                            .with_send_context("business message reject")?;
+                    }
+                    InboundDecision::TerminateSession => {
+                        error!("failed to send inbound message to application");
+                        self.state.disconnect_writer().await;
+                    }
                 }
                 self.store.increment_target_seq_number().await?;
             }
@@ -296,7 +306,7 @@ where
         &self,
         message: &Message,
         verify_target_seq_number: bool,
-    ) -> std::result::Result<(), MessageVerificationError> {
+    ) -> Result<(), MessageVerificationError> {
         let expected_seq_number = if verify_target_seq_number {
             Some(self.store.next_target_seq_number())
         } else {
@@ -796,7 +806,7 @@ where
             .reset_peer_timer(self.config.heartbeat_interval, test_request_id);
     }
 
-    async fn send_app_message(&mut self, message: Outbound) -> Result<SendOutcome, SendError> {
+    async fn send_app_message(&mut self, message: App::Outbound) -> Result<SendOutcome, SendError> {
         if !self.state.is_connected() {
             return Err(SendError::Disconnected);
         }
@@ -983,7 +993,7 @@ where
         }
     }
 
-    async fn handle_outbound_message(&mut self, request: OutboundRequest<Outbound>) {
+    async fn handle_outbound_message(&mut self, request: OutboundRequest<App::Outbound>) {
         let OutboundRequest { message, confirm } = request;
         let result = self.send_app_message(message).await;
         match confirm {
@@ -1131,15 +1141,13 @@ fn get_msg_seq_num(message: &Message) -> u64 {
         .expect("MsgSeqNum missing from validated message - parser bug")
 }
 
-async fn run_session<App, Inbound, Outbound, Store>(
-    mut session: Session<App, Inbound, Outbound, Store>,
+async fn run_session<App, Store>(
+    mut session: Session<App, Store>,
     mut event_receiver: mpsc::Receiver<SessionEvent>,
-    mut outbound_message_receiver: mpsc::Receiver<OutboundRequest<Outbound>>,
+    mut outbound_message_receiver: mpsc::Receiver<OutboundRequest<App::Outbound>>,
     mut admin_request_receiver: mpsc::Receiver<AdminRequest>,
 ) where
-    App: Application<Inbound, Outbound>,
-    Inbound: InboundMessage,
-    Outbound: OutboundMessage,
+    App: Application,
     Store: MessageStore + Send + 'static,
 {
     loop {
@@ -1196,7 +1204,7 @@ async fn run_session<App, Inbound, Outbound, Store>(
 mod tests {
     use super::*;
     use crate::application::{InboundDecision, OutboundDecision};
-    use crate::message::{InboundMessage, OutboundMessage};
+    use crate::message::OutboundMessage;
     use crate::store::{Result as StoreResult, StoreError};
     use chrono::{DateTime, Datelike, NaiveDate, NaiveTime, TimeDelta, Timelike};
     use chrono_tz::Tz;
@@ -1293,21 +1301,17 @@ mod tests {
         }
     }
 
-    impl InboundMessage for DummyMessage {
-        fn parse(_message: &Message) -> Self {
-            DummyMessage
-        }
-    }
-
     /// Minimal no-op application for testing
     struct NoOpApp;
 
     #[async_trait::async_trait]
-    impl Application<DummyMessage, DummyMessage> for NoOpApp {
+    impl Application for NoOpApp {
+        type Outbound = DummyMessage;
+
         async fn on_outbound_message(&self, _: &DummyMessage) -> OutboundDecision {
             OutboundDecision::Send
         }
-        async fn on_inbound_message(&self, _: DummyMessage) -> InboundDecision {
+        async fn on_inbound_message(&self, _: &Message) -> InboundDecision {
             InboundDecision::Accept
         }
         async fn on_logout(&mut self, _: &str) {}
@@ -1341,7 +1345,7 @@ mod tests {
         schedule: SessionSchedule,
         state: SessionState,
         store: TestStore,
-    ) -> Session<NoOpApp, DummyMessage, DummyMessage, TestStore> {
+    ) -> Session<NoOpApp, TestStore> {
         let config = create_test_config();
         let message_config = MessageConfig::default();
         let dictionary = Dictionary::fix44();
@@ -1357,7 +1361,6 @@ mod tests {
             store,
             schedule_check_timer: Box::pin(sleep(Duration::from_secs(1))),
             reset_on_next_logon: false,
-            _phantom: std::marker::PhantomData,
         }
     }
 
