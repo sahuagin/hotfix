@@ -1,5 +1,5 @@
 [package]
-name = "simple-new-order"
+name = "order-entry"
 version = "0.1.0"
 authors.workspace = true
 edition.workspace = true
@@ -10,10 +10,14 @@ publish = false
 hotfix = { path = "../../crates/hotfix", features = ["fix44", "mongodb"] }
 hotfix-web = { path = "../../crates/hotfix-web", features = ["ui"] }
 
+hotfix-message = { path = "../../crates/hotfix-message", features = ["fix44"] }
+
 anyhow.workspace = true
 async-trait.workspace = true
 axum.workspace = true
 clap = { workspace = true, features = ["derive"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
 tokio = { workspace = true, features = ["full"] }
 tokio-util.workspace = true
 tracing.workspace = true

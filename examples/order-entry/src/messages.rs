@@ -1,0 +1,119 @@
+use anyhow::{Context, Result};
+use hotfix::Message as HotfixMessage;
+use hotfix::field_types::{Date, Timestamp};
+use hotfix::fix44;
+use hotfix::message::{OutboundMessage, Part, RepeatingGroup};
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone)]
+pub struct NewOrderSingle {
+    // order details
+    pub transact_time: Timestamp,
+    pub symbol: String,    // CCY1/CCY2 as string
+    pub cl_ord_id: String, // unique order ID assigned by the customer
+    pub side: fix44::Side,
+    pub order_qty: u32,
+    pub settlement_date: Date,
+    pub currency: String, // the dealt currency
+
+    // allocation
+    pub number_of_allocations: u32,
+    pub allocation_account: String,
+    pub allocation_quantity: u32,
+}
+
+#[derive(Debug, Clone)]
+pub enum OutboundMsg {
+    NewOrderSingle(NewOrderSingle),
+}
+
+impl OutboundMessage for OutboundMsg {
+    fn write(&self, msg: &mut HotfixMessage) {
+        match self {
+            OutboundMsg::NewOrderSingle(order) => {
+                // order details
+                msg.set(fix44::TRANSACT_TIME, order.transact_time.clone());
+                msg.set(fix44::SYMBOL, order.symbol.as_str());
+                msg.set(fix44::CL_ORD_ID, order.cl_ord_id.as_str());
+                msg.set(fix44::SIDE, order.side);
+                msg.set(fix44::ORDER_QTY, order.order_qty);
+                msg.set(fix44::SETTL_DATE, order.settlement_date);
+                msg.set(fix44::CURRENCY, order.currency.as_str());
+
+                // allocations
+                msg.set(fix44::NO_ALLOCS, order.number_of_allocations);
+                let mut allocation = RepeatingGroup::new(fix44::NO_ALLOCS, fix44::ALLOC_ACCOUNT);
+                allocation.set(fix44::ALLOC_ACCOUNT, order.allocation_account.as_str());
+                allocation.set(fix44::ALLOC_QTY, order.allocation_quantity);
+                msg.set_groups(vec![allocation]).unwrap();
+            }
+        }
+    }
+
+    fn message_type(&self) -> &str {
+        match self {
+            OutboundMsg::NewOrderSingle(_) => "D",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NewOrderSingleDto {
+    pub symbol: String,
+    pub cl_ord_id: String,
+    pub side: String,
+    pub order_qty: u32,
+    pub settlement_date: String,
+    pub currency: String,
+    pub number_of_allocations: u32,
+    pub allocation_account: String,
+    pub allocation_quantity: u32,
+}
+
+impl NewOrderSingleDto {
+    pub fn into_order(self) -> Result<NewOrderSingle> {
+        let side = match self.side.as_str() {
+            "Buy" => fix44::Side::Buy,
+            "Sell" => fix44::Side::Sell,
+            other => anyhow::bail!("invalid side: {other}"),
+        };
+
+        let date_parts: Vec<&str> = self.settlement_date.split('-').collect();
+        if date_parts.len() != 3 {
+            anyhow::bail!("invalid settlement_date format, expected YYYY-MM-DD");
+        }
+        let year: u32 = date_parts[0].parse().context("invalid year")?;
+        let month: u32 = date_parts[1].parse().context("invalid month")?;
+        let day: u32 = date_parts[2].parse().context("invalid day")?;
+        let settlement_date = Date::new(year, month, day).context("invalid settlement date")?;
+
+        Ok(NewOrderSingle {
+            transact_time: Timestamp::utc_now(),
+            symbol: self.symbol,
+            cl_ord_id: self.cl_ord_id,
+            side,
+            order_qty: self.order_qty,
+            settlement_date,
+            currency: self.currency,
+            number_of_allocations: self.number_of_allocations,
+            allocation_account: self.allocation_account,
+            allocation_quantity: self.allocation_quantity,
+        })
+    }
+}
+
+pub fn random_order_json() -> NewOrderSingleDto {
+    let mut order_id = format!("{}", uuid::Uuid::new_v4());
+    order_id.truncate(12);
+    NewOrderSingleDto {
+        symbol: "EUR/USD".to_string(),
+        cl_ord_id: order_id,
+        side: "Buy".to_string(),
+        order_qty: 230,
+        settlement_date: "2023-09-19".to_string(),
+        currency: "USD".to_string(),
+        number_of_allocations: 1,
+        allocation_account: "acc1".to_string(),
+        allocation_quantity: 230,
+    }
+}

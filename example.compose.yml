@@ -1,0 +1,14 @@
+services:
+  initiator-example:
+    build:
+      context: .
+      dockerfile: examples/order-entry/Dockerfile
+    environment:
+      RUST_LOG: debug
+    ports:
+      - "9881:9881"
+
+  dummy-executor:
+    build: dummy-executor
+    ports:
+      - "9880:9880"
