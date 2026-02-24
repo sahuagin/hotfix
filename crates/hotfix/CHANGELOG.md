@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0](https://github.com/Validus-Risk-Management/hotfix/compare/hotfix-v0.9.1...hotfix-v0.10.0) - 2026-02-24
+
+### Fixed
+
+- resolve deadlock when both sides send resendrequest simultaneously ([#314](https://github.com/Validus-Risk-Management/hotfix/pull/314))
+
 ## [0.9.1](https://github.com/Validus-Risk-Management/hotfix/compare/hotfix-v0.9.0...hotfix-v0.9.1) - 2026-02-09
 
 ### Other
