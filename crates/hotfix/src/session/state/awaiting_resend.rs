@@ -472,15 +472,13 @@ pub(crate) enum AwaitingResendTransitionOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::state::AwaitingLogoutState;
     use tokio::sync::mpsc;
-    use tokio::time::Instant;
 
     #[test]
-    fn test_awaiting_resend_transition_begin_seq_number_too_low() {
+    fn test_update_begin_seq_number_too_low() {
         let writer = create_writer_ref();
-        let mut state = SessionState::AwaitingResend(AwaitingResendState::new(writer, 1, 5));
-        let result = state.try_transition_to_awaiting_resend(0, 5);
+        let mut state = AwaitingResendState::new(writer, 1, 5);
+        let result = state.update(0, 5);
         assert!(matches!(
             result,
             AwaitingResendTransitionOutcome::BeginSeqNumberTooLow
@@ -488,18 +486,18 @@ mod tests {
     }
 
     #[test]
-    fn test_awaiting_resend_transition_attempts_exceeded() {
+    fn test_update_attempts_exceeded() {
         let writer = create_writer_ref();
-        let mut state = SessionState::AwaitingResend(AwaitingResendState::new(writer, 1, 5));
+        let mut state = AwaitingResendState::new(writer, 1, 5);
 
-        // we can transition twice more without hitting the limit
-        let result = state.try_transition_to_awaiting_resend(1, 5);
+        // we can update twice more without hitting the limit
+        let result = state.update(1, 5);
         assert!(matches!(result, AwaitingResendTransitionOutcome::Success));
-        let result = state.try_transition_to_awaiting_resend(1, 5);
+        let result = state.update(1, 5);
         assert!(matches!(result, AwaitingResendTransitionOutcome::Success));
 
-        // the fourth time we'd get into an AwaitingResendState with the same begin seq number, we get an error
-        let result = state.try_transition_to_awaiting_resend(1, 5);
+        // the fourth time with the same begin seq number, we get an error
+        let result = state.update(1, 5);
         assert!(matches!(
             result,
             AwaitingResendTransitionOutcome::AttemptsExceeded
@@ -507,18 +505,20 @@ mod tests {
     }
 
     #[test]
-    fn test_awaiting_resend_transition_when_awaiting_logout_is_prevented() {
-        let mut state = SessionState::AwaitingLogout(AwaitingLogoutState {
-            writer: create_writer_ref(),
-            logout_timeout: Instant::now(),
-            reconnect: false,
-        });
+    fn test_update_resets_attempts_on_new_begin_seq() {
+        let writer = create_writer_ref();
+        let mut state = AwaitingResendState::new(writer, 1, 5);
 
-        let result = state.try_transition_to_awaiting_resend(1, 5);
-        assert!(matches!(
-            result,
-            AwaitingResendTransitionOutcome::InvalidState(_)
-        ));
+        // Use up attempts on begin=1
+        let result = state.update(1, 5);
+        assert!(matches!(result, AwaitingResendTransitionOutcome::Success));
+        let result = state.update(1, 5);
+        assert!(matches!(result, AwaitingResendTransitionOutcome::Success));
+
+        // A new begin_seq resets the counter
+        let result = state.update(3, 10);
+        assert!(matches!(result, AwaitingResendTransitionOutcome::Success));
+        assert_eq!(state.resend_attempts, 1);
     }
 
     fn create_writer_ref() -> WriterRef {

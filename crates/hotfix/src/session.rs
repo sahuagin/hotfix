@@ -10,7 +10,6 @@ use chrono::Utc;
 use hotfix_message::dict::Dictionary;
 use hotfix_message::message::{Config as MessageConfig, Message};
 use hotfix_message::{MessageBuilder, Part};
-use std::future::Future;
 use std::pin::Pin;
 use tokio::select;
 use tokio::sync::mpsc;
@@ -193,17 +192,18 @@ where
         Ok(())
     }
 
-    fn dispatch_valid_message(
-        &mut self,
-        message: Message,
-    ) -> Pin<Box<dyn Future<Output = Result<(), SessionOperationError>> + Send + '_>> {
-        Box::pin(self.dispatch_valid_message_inner(message))
-    }
-
-    async fn dispatch_valid_message_inner(
+    async fn dispatch_valid_message(
         &mut self,
         message: Message,
     ) -> Result<(), SessionOperationError> {
+        let transition = self.dispatch_to_state(message).await?;
+        self.apply_transition(transition).await
+    }
+
+    async fn dispatch_to_state(
+        &mut self,
+        message: Message,
+    ) -> Result<TransitionResult, SessionOperationError> {
         let Session {
             ref mut state,
             ref mut store,
@@ -235,10 +235,7 @@ where
             SessionState::Disconnected(_) => TransitionResult::Stay,
         };
 
-        // Let ctx go out of scope before we can mutate self.state
-        let _ = ctx;
-
-        self.apply_transition(transition).await
+        Ok(transition)
     }
 
     async fn apply_transition(
@@ -273,7 +270,12 @@ where
                         // for sequence accounting purposes.
                         self.store.increment_target_seq_number().await?;
                     } else {
-                        self.dispatch_valid_message(msg).await?;
+                        let inner_transition = self.dispatch_to_state(msg).await?;
+                        // Backlog messages can't produce more backlogs (only AwaitingResend
+                        // produces TransitionWithBacklog, and we've already transitioned to Active)
+                        if let TransitionResult::TransitionTo(s) = inner_transition {
+                            self.state = s;
+                        }
                     }
                 }
                 debug!("resend backlog is cleared, resuming normal operation");
@@ -366,12 +368,22 @@ where
         reason: &str,
         reconnect: bool,
     ) -> Result<(), SessionOperationError> {
-        if self.state.try_transition_to_awaiting_logout(
-            Duration::from_secs(self.config.logout_timeout),
-            reconnect,
-        ) {
-            self.send_logout(reason).await?;
+        if matches!(self.state, SessionState::AwaitingLogout(_)) {
+            debug!("already in awaiting logout state");
+            return Ok(());
         }
+
+        let Some(writer) = self.state.get_writer().cloned() else {
+            error!("trying to transition to awaiting logout without an established connection");
+            return Ok(());
+        };
+
+        self.state = SessionState::AwaitingLogout(state::AwaitingLogoutState {
+            writer,
+            logout_timeout: Instant::now() + Duration::from_secs(self.config.logout_timeout),
+            reconnect,
+        });
+        self.send_logout(reason).await?;
 
         Ok(())
     }
