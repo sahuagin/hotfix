@@ -55,10 +55,7 @@ impl AwaitingLogoutState {
                 VerifyResult::SeqTooHigh { .. } => {
                     // verify with check_too_high=false, shouldn't happen
                 }
-                VerifyResult::ErrorHandled(Some(new_state)) => {
-                    return Ok(TransitionResult::TransitionTo(new_state));
-                }
-                VerifyResult::ErrorHandled(None) => return Ok(TransitionResult::Stay),
+                VerifyResult::Handled(transition) => return Ok(transition),
             }
 
             app.on_logout("peer has logged us out").await;

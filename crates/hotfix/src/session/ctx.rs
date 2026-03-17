@@ -45,7 +45,7 @@ pub(crate) enum TransitionResult {
 pub(crate) enum VerifyResult {
     Passed,
     SeqTooHigh { expected: u64, actual: u64 },
-    ErrorHandled(Option<SessionState>),
+    Handled(TransitionResult),
 }
 
 impl<Store: MessageStore> SessionCtx<'_, Store> {
@@ -133,18 +133,19 @@ impl<Store: MessageStore> SessionCtx<'_, Store> {
             }
             Err(err) => {
                 let transition = self.handle_verification_error(writer, err).await?;
-                Ok(VerifyResult::ErrorHandled(transition))
+                Ok(VerifyResult::Handled(transition))
             }
         }
     }
 
     /// Handle a verification error (excluding SeqNumberTooHigh which is returned separately).
-    /// Returns `Some(new_state)` if a state transition is needed.
+    /// Returns the `TransitionResult` to use — either `Stay` (error was handled in-place)
+    /// or `TransitionTo` (a state change is needed).
     pub async fn handle_verification_error(
         &mut self,
         writer: &WriterRef,
         error: MessageVerificationError,
-    ) -> Result<Option<SessionState>, SessionOperationError> {
+    ) -> Result<TransitionResult, SessionOperationError> {
         match error {
             MessageVerificationError::SeqNumberTooLow {
                 expected,
@@ -159,20 +160,24 @@ impl<Store: MessageStore> SessionCtx<'_, Store> {
                 warn!(
                     "handle_verification_error called with SeqNumberTooHigh({expected}, {actual}) - caller should use verify_and_handle"
                 );
-                Ok(None)
+                Ok(TransitionResult::Stay)
             }
-            MessageVerificationError::IncorrectBeginString(begin_string) => Ok(Some(
-                self.handle_incorrect_begin_string(writer, begin_string)
-                    .await,
-            )),
+            MessageVerificationError::IncorrectBeginString(begin_string) => {
+                let new_state = self
+                    .handle_incorrect_begin_string(writer, begin_string)
+                    .await;
+                Ok(TransitionResult::TransitionTo(new_state))
+            }
             MessageVerificationError::IncorrectCompId {
                 comp_id,
                 comp_id_type,
                 msg_seq_num,
-            } => Ok(Some(
-                self.handle_incorrect_comp_id(writer, comp_id, comp_id_type, msg_seq_num)
-                    .await,
-            )),
+            } => {
+                let new_state = self
+                    .handle_incorrect_comp_id(writer, comp_id, comp_id_type, msg_seq_num)
+                    .await;
+                Ok(TransitionResult::TransitionTo(new_state))
+            }
             MessageVerificationError::SendingTimeAccuracyIssue { msg_seq_num } => {
                 self.handle_sending_time_accuracy_problem(
                     writer,
@@ -180,7 +185,7 @@ impl<Store: MessageStore> SessionCtx<'_, Store> {
                     "unexpected sending time",
                 )
                 .await;
-                Ok(None)
+                Ok(TransitionResult::Stay)
             }
             MessageVerificationError::SendingTimeMissing { msg_seq_num } => {
                 self.handle_sending_time_accuracy_problem(
@@ -189,12 +194,12 @@ impl<Store: MessageStore> SessionCtx<'_, Store> {
                     "sending time missing",
                 )
                 .await;
-                Ok(None)
+                Ok(TransitionResult::Stay)
             }
             MessageVerificationError::OriginalSendingTimeMissing { msg_seq_num } => {
                 self.handle_original_sending_time_missing(writer, msg_seq_num)
                     .await;
-                Ok(None)
+                Ok(TransitionResult::Stay)
             }
             MessageVerificationError::OriginalSendingTimeAfterSendingTime {
                 msg_seq_num, ..
@@ -205,7 +210,7 @@ impl<Store: MessageStore> SessionCtx<'_, Store> {
                     "original sending time is after sending time",
                 )
                 .await;
-                Ok(None)
+                Ok(TransitionResult::Stay)
             }
         }
     }
@@ -250,19 +255,19 @@ impl<Store: MessageStore> SessionCtx<'_, Store> {
         expected: u64,
         actual: u64,
         possible_duplicate: bool,
-    ) -> Option<SessionState> {
+    ) -> TransitionResult {
         if possible_duplicate {
             warn!(
                 "sequence number too low (expected {expected}, actual {actual}, but counterparty indicated it's poss duplicate, ignoring"
             );
-            return None;
+            return TransitionResult::Stay;
         }
         error!(
             "we expected {expected} sequence number, but target sent lower ({actual}), terminating..."
         );
         let reason = format!("sequence number too low (actual {actual}, expected {expected})");
         self.logout_and_terminate(writer, &reason).await;
-        Some(SessionState::new_disconnected(false, &reason))
+        TransitionResult::TransitionTo(SessionState::new_disconnected(false, &reason))
     }
 
     async fn handle_sending_time_accuracy_problem(

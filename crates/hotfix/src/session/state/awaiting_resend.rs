@@ -146,10 +146,7 @@ impl AwaitingResendState {
             VerifyResult::SeqTooHigh { expected, actual } => {
                 return self.handle_seq_too_high(ctx, expected, actual).await;
             }
-            VerifyResult::ErrorHandled(Some(new_state)) => {
-                return Ok(TransitionResult::TransitionTo(new_state));
-            }
-            VerifyResult::ErrorHandled(None) => return Ok(TransitionResult::Stay),
+            VerifyResult::Handled(transition) => return Ok(transition),
         }
 
         ctx.store.increment_target_seq_number().await?;
@@ -169,10 +166,7 @@ impl AwaitingResendState {
             VerifyResult::SeqTooHigh { expected, actual } => {
                 return self.handle_seq_too_high(ctx, expected, actual).await;
             }
-            VerifyResult::ErrorHandled(Some(new_state)) => {
-                return Ok(TransitionResult::TransitionTo(new_state));
-            }
-            VerifyResult::ErrorHandled(None) => return Ok(TransitionResult::Stay),
+            VerifyResult::Handled(transition) => return Ok(transition),
         }
 
         let req_id: &str = message.get(TEST_REQ_ID).unwrap_or_else(|_| todo!());
@@ -199,10 +193,7 @@ impl AwaitingResendState {
             VerifyResult::SeqTooHigh { .. } => {
                 // check_too_high=false, shouldn't happen
             }
-            VerifyResult::ErrorHandled(Some(new_state)) => {
-                return Ok(TransitionResult::TransitionTo(new_state));
-            }
-            VerifyResult::ErrorHandled(None) => return Ok(TransitionResult::Stay),
+            VerifyResult::Handled(transition) => return Ok(transition),
         }
 
         let msg_seq_num = get_msg_seq_num(message);
@@ -270,10 +261,7 @@ impl AwaitingResendState {
             VerifyResult::SeqTooHigh { expected, actual } => {
                 return self.handle_seq_too_high(ctx, expected, actual).await;
             }
-            VerifyResult::ErrorHandled(Some(new_state)) => {
-                return Ok(TransitionResult::TransitionTo(new_state));
-            }
-            VerifyResult::ErrorHandled(None) => return Ok(TransitionResult::Stay),
+            VerifyResult::Handled(transition) => return Ok(transition),
         }
 
         ctx.store.increment_target_seq_number().await?;
@@ -295,10 +283,7 @@ impl AwaitingResendState {
             VerifyResult::SeqTooHigh { expected, actual } => {
                 return self.handle_seq_too_high(ctx, expected, actual).await;
             }
-            VerifyResult::ErrorHandled(Some(new_state)) => {
-                return Ok(TransitionResult::TransitionTo(new_state));
-            }
-            VerifyResult::ErrorHandled(None) => return Ok(TransitionResult::Stay),
+            VerifyResult::Handled(transition) => return Ok(transition),
         }
 
         let end: u64 = match message.get(NEW_SEQ_NO) {
@@ -349,10 +334,7 @@ impl AwaitingResendState {
         {
             VerifyResult::Passed => {}
             VerifyResult::SeqTooHigh { .. } => {}
-            VerifyResult::ErrorHandled(Some(new_state)) => {
-                return Ok(TransitionResult::TransitionTo(new_state));
-            }
-            VerifyResult::ErrorHandled(None) => return Ok(TransitionResult::Stay),
+            VerifyResult::Handled(transition) => return Ok(transition),
         }
 
         // We are in AwaitingResend (logged on), send logout response
@@ -386,10 +368,7 @@ impl AwaitingResendState {
             VerifyResult::SeqTooHigh { expected, actual } => {
                 return self.handle_seq_too_high(ctx, expected, actual).await;
             }
-            VerifyResult::ErrorHandled(Some(new_state)) => {
-                return Ok(TransitionResult::TransitionTo(new_state));
-            }
-            VerifyResult::ErrorHandled(None) => return Ok(TransitionResult::Stay),
+            VerifyResult::Handled(transition) => return Ok(transition),
         }
 
         match app.on_inbound_message(message).await {

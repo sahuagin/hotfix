@@ -387,8 +387,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_send_delegates_to_session_handle() {
-        use crate::session::error::SendOutcome;
-
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let config = create_test_config("127.0.0.1", port);

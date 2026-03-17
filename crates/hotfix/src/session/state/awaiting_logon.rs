@@ -75,10 +75,7 @@ impl AwaitingLogonState {
                 ));
                 Ok(TransitionResult::TransitionTo(new_state))
             }
-            VerifyResult::ErrorHandled(Some(new_state)) => {
-                Ok(TransitionResult::TransitionTo(new_state))
-            }
-            VerifyResult::ErrorHandled(None) => Ok(TransitionResult::Stay),
+            VerifyResult::Handled(transition) => Ok(transition),
         }
     }
 }
