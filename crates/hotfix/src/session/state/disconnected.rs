@@ -1,5 +1,6 @@
 use crate::session::event::AwaitingActiveSessionResponse;
 use tokio::sync::oneshot;
+use tracing::{debug, error};
 
 pub(crate) struct DisconnectedState {
     pub(crate) reconnect: bool,
@@ -31,5 +32,31 @@ impl DisconnectedState {
         &mut self,
     ) -> Option<oneshot::Sender<AwaitingActiveSessionResponse>> {
         self.session_awaiter.take()
+    }
+
+    pub(crate) fn should_reconnect(&self) -> bool {
+        self.reconnect
+    }
+
+    pub(crate) fn register_session_awaiter(
+        &mut self,
+        responder: oneshot::Sender<AwaitingActiveSessionResponse>,
+    ) -> Result<(), oneshot::Sender<AwaitingActiveSessionResponse>> {
+        if self.has_session_awaiter() {
+            Err(responder)
+        } else {
+            self.set_session_awaiter(responder);
+            Ok(())
+        }
+    }
+
+    pub(crate) fn notify_session_awaiter(&mut self) {
+        if let Some(awaiter) = self.take_session_awaiter() {
+            if let Err(err) = awaiter.send(AwaitingActiveSessionResponse::Active) {
+                error!("failed to send session awaiter response: {err:?}");
+            } else {
+                debug!("notified session awaiter");
+            }
+        }
     }
 }

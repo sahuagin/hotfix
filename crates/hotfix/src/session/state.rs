@@ -59,7 +59,7 @@ impl SessionState {
 
     pub fn should_reconnect(&self) -> bool {
         match self {
-            SessionState::Disconnected(DisconnectedState { reconnect, .. }) => *reconnect,
+            SessionState::Disconnected(state) => state.should_reconnect(),
             _ => true,
         }
     }
@@ -173,7 +173,7 @@ impl SessionState {
     ) {
         match self {
             SessionState::Disconnected(state) => {
-                if state.has_session_awaiter() {
+                if let Err(responder) = state.register_session_awaiter(responder) {
                     let reason = &state.reason;
                     error!(
                         "session awaiter already registered on state disconnected due to: {reason}"
@@ -181,9 +181,6 @@ impl SessionState {
                     if let Err(err) = responder.send(AwaitingActiveSessionResponse::Shutdown) {
                         error!("failed to send session awaiter response: {err:?}");
                     }
-                } else {
-                    state.set_session_awaiter(responder);
-                    debug!("registered session awaiter");
                 }
             }
             _ => {
@@ -196,42 +193,31 @@ impl SessionState {
     }
 
     pub fn notify_session_awaiter(&mut self) {
-        if let SessionState::Disconnected(state) = self
-            && let Some(awaiter) = state.take_session_awaiter()
-        {
-            if let Err(err) = awaiter.send(AwaitingActiveSessionResponse::Active) {
-                error!("failed to send session awaiter response: {err:?}");
-            } else {
-                debug!("notified session awaiter");
-            }
+        if let SessionState::Disconnected(state) = self {
+            state.notify_session_awaiter();
         }
     }
 
     pub fn heartbeat_deadline(&self) -> Option<&Instant> {
         match self {
-            Self::Active(ActiveState {
-                heartbeat_deadline, ..
-            }) => Some(heartbeat_deadline),
+            Self::Active(state) => Some(state.heartbeat_deadline()),
             _ => None,
         }
     }
 
     pub fn reset_heartbeat_timer(&mut self, heartbeat_interval: u64) {
-        if let Self::Active(ActiveState {
-            heartbeat_deadline, ..
-        }) = self
-        {
-            *heartbeat_deadline = Instant::now() + Duration::from_secs(heartbeat_interval);
+        if let Self::Active(state) = self {
+            state.reset_heartbeat_timer(heartbeat_interval);
         }
     }
 
     pub fn peer_deadline(&self) -> Option<&Instant> {
         match self {
-            Self::Active(ActiveState { peer_deadline, .. }) => Some(peer_deadline),
+            Self::Active(state) => Some(state.peer_deadline()),
             Self::AwaitingLogon(AwaitingLogonState { logon_timeout, .. }) => Some(logon_timeout),
-            Self::AwaitingLogout(AwaitingLogoutState {
-                logout_timeout, ..
-            }) => Some(logout_timeout),
+            Self::AwaitingLogout(AwaitingLogoutState { logout_timeout, .. }) => {
+                Some(logout_timeout)
+            }
             _ => None,
         }
     }
@@ -241,24 +227,14 @@ impl SessionState {
         heartbeat_interval: u64,
         test_request_id: Option<TestRequestId>,
     ) {
-        if let Self::Active(ActiveState {
-            peer_deadline,
-            sent_test_request_id,
-            ..
-        }) = self
-        {
-            let interval = calculate_peer_interval(heartbeat_interval);
-            *peer_deadline = Instant::now() + Duration::from_secs(interval);
-            *sent_test_request_id = test_request_id;
+        if let Self::Active(state) = self {
+            state.reset_peer_timer(heartbeat_interval, test_request_id);
         }
     }
 
     pub fn expected_test_response_id(&self) -> Option<&TestRequestId> {
         match self {
-            Self::Active(ActiveState {
-                sent_test_request_id: expected_test_response_id,
-                ..
-            }) => expected_test_response_id.as_ref(),
+            Self::Active(state) => state.expected_test_response_id(),
             _ => None,
         }
     }
