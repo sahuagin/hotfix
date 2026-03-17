@@ -46,6 +46,11 @@ impl ActiveState {
         self.sent_test_request_id.as_ref()
     }
 
+    pub(crate) async fn on_disconnect(&self, reason: &str) -> SessionState {
+        self.writer.disconnect().await;
+        SessionState::new_disconnected(true, reason)
+    }
+
     pub(crate) async fn on_peer_timeout<Store: MessageStore>(
         &mut self,
         ctx: &mut SessionCtx<'_, Store>,

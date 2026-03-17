@@ -9,6 +9,11 @@ pub(crate) struct AwaitingLogonState {
 }
 
 impl AwaitingLogonState {
+    pub(crate) async fn on_disconnect(&self, reason: &str) -> super::SessionState {
+        self.writer.disconnect().await;
+        super::SessionState::new_disconnected(true, reason)
+    }
+
     pub(crate) async fn on_peer_timeout(&self) {
         warn!("peer didn't respond to our Logon, disconnecting..");
         self.writer.disconnect().await;

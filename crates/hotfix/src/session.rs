@@ -335,11 +335,9 @@ where
     }
 
     async fn on_connect(&mut self, writer: WriterRef) -> Result<(), SessionOperationError> {
-        self.state = SessionState::AwaitingLogon(AwaitingLogonState {
-            writer,
-            logon_sent: false,
-            logon_timeout: Instant::now() + Duration::from_secs(self.config.logon_timeout),
-        });
+        if let SessionState::Disconnected(s) = &self.state {
+            self.state = s.on_connect(writer, Duration::from_secs(self.config.logon_timeout));
+        }
         self.reset_peer_timer(None);
         self.send_logon().await?;
 
@@ -347,19 +345,18 @@ where
     }
 
     async fn on_disconnect(&mut self, reason: String) {
-        match self.state {
-            SessionState::Active(_)
-            | SessionState::AwaitingLogon(_)
-            | SessionState::AwaitingResend(_) => {
-                self.state.disconnect_writer().await;
-                self.state = SessionState::new_disconnected(true, &reason);
-            }
+        let transition = match &self.state {
+            SessionState::Active(s) => Some(s.on_disconnect(&reason).await),
+            SessionState::AwaitingLogon(s) => Some(s.on_disconnect(&reason).await),
+            SessionState::AwaitingResend(s) => Some(s.on_disconnect(&reason).await),
+            SessionState::AwaitingLogout(s) => Some(s.on_disconnect(&reason)),
             SessionState::Disconnected(_) => {
-                warn!("disconnect message was received, but the session is already disconnected")
+                warn!("disconnect message was received, but the session is already disconnected");
+                None
             }
-            SessionState::AwaitingLogout(AwaitingLogoutState { reconnect, .. }) => {
-                self.state = SessionState::new_disconnected(reconnect, &reason);
-            }
+        };
+        if let Some(new_state) = transition {
+            self.state = new_state;
         }
     }
 

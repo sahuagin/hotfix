@@ -1,5 +1,9 @@
 use crate::session::event::AwaitingActiveSessionResponse;
+use crate::session::state::AwaitingLogonState;
+use crate::transport::writer::WriterRef;
+use std::time::Duration;
 use tokio::sync::oneshot;
+use tokio::time::Instant;
 use tracing::{debug, error};
 
 pub(crate) struct DisconnectedState {
@@ -32,6 +36,18 @@ impl DisconnectedState {
         &mut self,
     ) -> Option<oneshot::Sender<AwaitingActiveSessionResponse>> {
         self.session_awaiter.take()
+    }
+
+    pub(crate) fn on_connect(
+        &self,
+        writer: WriterRef,
+        logon_timeout: Duration,
+    ) -> super::SessionState {
+        super::SessionState::AwaitingLogon(AwaitingLogonState {
+            writer,
+            logon_sent: false,
+            logon_timeout: Instant::now() + logon_timeout,
+        })
     }
 
     pub(crate) fn should_reconnect(&self) -> bool {

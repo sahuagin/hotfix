@@ -19,6 +19,11 @@ pub(crate) struct AwaitingResendState {
 }
 
 impl AwaitingResendState {
+    pub(crate) async fn on_disconnect(&self, reason: &str) -> super::SessionState {
+        self.writer.disconnect().await;
+        super::SessionState::new_disconnected(true, reason)
+    }
+
     pub(crate) fn new(writer: WriterRef, begin_seq_number: u64, end_seq_number: u64) -> Self {
         Self {
             writer,
