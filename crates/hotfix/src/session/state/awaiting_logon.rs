@@ -1,6 +1,7 @@
 use crate::Application;
 use crate::message::logon::Logon;
 use crate::session::error::SessionOperationError;
+use crate::session::message_handling;
 use crate::session::state::{SessionCtx, SessionState, TransitionResult, VerifyResult};
 use crate::transport::writer::WriterRef;
 use hotfix_message::Part;
@@ -42,10 +43,7 @@ impl AwaitingLogonState {
         }
 
         // process logon
-        match ctx
-            .verify_and_handle(&self.writer, &message, true, true)
-            .await?
-        {
+        match message_handling::verify_and_handle(ctx, &self.writer, &message, true, true).await? {
             VerifyResult::Passed => {
                 // happy logon flow, the session is now active
                 let new_state =

@@ -1,6 +1,7 @@
 use crate::Application;
 use crate::message::logout::Logout;
 use crate::session::error::SessionOperationError;
+use crate::session::message_handling;
 use crate::session::state::{SessionCtx, SessionState, TransitionResult, VerifyResult};
 use crate::transport::writer::WriterRef;
 use hotfix_message::Part;
@@ -47,8 +48,7 @@ impl AwaitingLogoutState {
 
         if message_type == Logout::MSG_TYPE {
             // Process the logout
-            match ctx
-                .verify_and_handle(&self.writer, &message, false, false)
+            match message_handling::verify_and_handle(ctx, &self.writer, &message, false, false)
                 .await?
             {
                 VerifyResult::Passed => {}

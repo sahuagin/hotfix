@@ -10,6 +10,7 @@ use crate::message::sequence_reset::SequenceReset;
 use crate::message::test_request::TestRequest;
 use crate::session::error::{InternalSendResultExt, SendError, SendOutcome, SessionOperationError};
 use crate::session::get_msg_seq_num;
+use crate::session::message_handling;
 use crate::session::state::{
     AwaitingResendState, SessionCtx, SessionState, TestRequestId, TransitionResult, VerifyResult,
 };
@@ -142,10 +143,7 @@ impl ActiveState {
         ctx: &mut SessionCtx<'_, Store>,
         message: &hotfix_message::message::Message,
     ) -> Result<TransitionResult, SessionOperationError> {
-        match ctx
-            .verify_and_handle(&self.writer, message, true, true)
-            .await?
-        {
+        match message_handling::verify_and_handle(ctx, &self.writer, message, true, true).await? {
             VerifyResult::Passed => {}
             VerifyResult::SeqTooHigh { expected, actual } => {
                 return self
@@ -173,10 +171,7 @@ impl ActiveState {
         ctx: &mut SessionCtx<'_, Store>,
         message: &hotfix_message::message::Message,
     ) -> Result<TransitionResult, SessionOperationError> {
-        match ctx
-            .verify_and_handle(&self.writer, message, true, true)
-            .await?
-        {
+        match message_handling::verify_and_handle(ctx, &self.writer, message, true, true).await? {
             VerifyResult::Passed => {}
             VerifyResult::SeqTooHigh { expected, actual } => {
                 return self
@@ -206,10 +201,7 @@ impl ActiveState {
         ctx: &mut SessionCtx<'_, Store>,
         message: &hotfix_message::message::Message,
     ) -> Result<TransitionResult, SessionOperationError> {
-        match ctx
-            .verify_and_handle(&self.writer, message, false, true)
-            .await?
-        {
+        match message_handling::verify_and_handle(ctx, &self.writer, message, false, true).await? {
             VerifyResult::Passed => {}
             VerifyResult::SeqTooHigh { .. } => {
                 // ResendRequest with check_too_high=false should never get SeqTooHigh,
@@ -261,7 +253,7 @@ impl ActiveState {
             ctx.store.increment_target_seq_number().await?;
         }
 
-        ctx.resend_messages(&self.writer, begin_seq_number, end_seq_number)
+        message_handling::resend_messages(ctx, &self.writer, begin_seq_number, end_seq_number)
             .await?;
         self.reset_heartbeat_timer(ctx.config.heartbeat_interval);
 
@@ -273,10 +265,7 @@ impl ActiveState {
         ctx: &mut SessionCtx<'_, Store>,
         message: &hotfix_message::message::Message,
     ) -> Result<TransitionResult, SessionOperationError> {
-        match ctx
-            .verify_and_handle(&self.writer, message, false, true)
-            .await?
-        {
+        match message_handling::verify_and_handle(ctx, &self.writer, message, false, true).await? {
             VerifyResult::Passed => {}
             VerifyResult::SeqTooHigh { expected, actual } => {
                 return self
@@ -297,9 +286,14 @@ impl ActiveState {
     ) -> Result<TransitionResult, SessionOperationError> {
         let msg_seq_num = get_msg_seq_num(message);
         let is_gap_fill: bool = message.get(GAP_FILL_FLAG).unwrap_or(false);
-        match ctx
-            .verify_and_handle(&self.writer, message, is_gap_fill, is_gap_fill)
-            .await?
+        match message_handling::verify_and_handle(
+            ctx,
+            &self.writer,
+            message,
+            is_gap_fill,
+            is_gap_fill,
+        )
+        .await?
         {
             VerifyResult::Passed => {}
             VerifyResult::SeqTooHigh { expected, actual } => {
@@ -354,10 +348,7 @@ impl ActiveState {
         app: &mut App,
         message: &hotfix_message::message::Message,
     ) -> Result<TransitionResult, SessionOperationError> {
-        match ctx
-            .verify_and_handle(&self.writer, message, false, false)
-            .await?
-        {
+        match message_handling::verify_and_handle(ctx, &self.writer, message, false, false).await? {
             VerifyResult::Passed => {}
             VerifyResult::SeqTooHigh { .. } => {
                 // verify with check_too_high=false, so this shouldn't happen
@@ -391,10 +382,7 @@ impl ActiveState {
         app: &mut App,
         message: &hotfix_message::message::Message,
     ) -> Result<TransitionResult, SessionOperationError> {
-        match ctx
-            .verify_and_handle(&self.writer, message, true, true)
-            .await?
-        {
+        match message_handling::verify_and_handle(ctx, &self.writer, message, true, true).await? {
             VerifyResult::Passed => {}
             VerifyResult::SeqTooHigh { expected, actual } => {
                 return self

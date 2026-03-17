@@ -10,6 +10,7 @@ use crate::message::sequence_reset::SequenceReset;
 use crate::message::test_request::TestRequest;
 use crate::session::error::{InternalSendResultExt, SessionOperationError};
 use crate::session::get_msg_seq_num;
+use crate::session::message_handling;
 use crate::session::state::{SessionCtx, SessionState, TransitionResult, VerifyResult};
 use crate::transport::writer::WriterRef;
 use hotfix_message::Part;
@@ -138,10 +139,7 @@ impl AwaitingResendState {
         ctx: &mut SessionCtx<'_, Store>,
         message: &Message,
     ) -> Result<TransitionResult, SessionOperationError> {
-        match ctx
-            .verify_and_handle(&self.writer, message, true, true)
-            .await?
-        {
+        match message_handling::verify_and_handle(ctx, &self.writer, message, true, true).await? {
             VerifyResult::Passed => {}
             VerifyResult::SeqTooHigh { expected, actual } => {
                 return self.handle_seq_too_high(ctx, expected, actual).await;
@@ -158,10 +156,7 @@ impl AwaitingResendState {
         ctx: &mut SessionCtx<'_, Store>,
         message: &Message,
     ) -> Result<TransitionResult, SessionOperationError> {
-        match ctx
-            .verify_and_handle(&self.writer, message, true, true)
-            .await?
-        {
+        match message_handling::verify_and_handle(ctx, &self.writer, message, true, true).await? {
             VerifyResult::Passed => {}
             VerifyResult::SeqTooHigh { expected, actual } => {
                 return self.handle_seq_too_high(ctx, expected, actual).await;
@@ -185,10 +180,7 @@ impl AwaitingResendState {
         ctx: &mut SessionCtx<'_, Store>,
         message: &Message,
     ) -> Result<TransitionResult, SessionOperationError> {
-        match ctx
-            .verify_and_handle(&self.writer, message, false, true)
-            .await?
-        {
+        match message_handling::verify_and_handle(ctx, &self.writer, message, false, true).await? {
             VerifyResult::Passed => {}
             VerifyResult::SeqTooHigh { .. } => {
                 // check_too_high=false, shouldn't happen
@@ -242,7 +234,7 @@ impl AwaitingResendState {
             ctx.store.increment_target_seq_number().await?;
         }
 
-        ctx.resend_messages(&self.writer, begin_seq_number, end_seq_number)
+        message_handling::resend_messages(ctx, &self.writer, begin_seq_number, end_seq_number)
             .await?;
 
         Ok(TransitionResult::Stay)
@@ -253,10 +245,7 @@ impl AwaitingResendState {
         ctx: &mut SessionCtx<'_, Store>,
         message: &Message,
     ) -> Result<TransitionResult, SessionOperationError> {
-        match ctx
-            .verify_and_handle(&self.writer, message, false, true)
-            .await?
-        {
+        match message_handling::verify_and_handle(ctx, &self.writer, message, false, true).await? {
             VerifyResult::Passed => {}
             VerifyResult::SeqTooHigh { expected, actual } => {
                 return self.handle_seq_too_high(ctx, expected, actual).await;
@@ -275,9 +264,14 @@ impl AwaitingResendState {
     ) -> Result<TransitionResult, SessionOperationError> {
         let msg_seq_num = get_msg_seq_num(message);
         let is_gap_fill: bool = message.get(GAP_FILL_FLAG).unwrap_or(false);
-        match ctx
-            .verify_and_handle(&self.writer, message, is_gap_fill, is_gap_fill)
-            .await?
+        match message_handling::verify_and_handle(
+            ctx,
+            &self.writer,
+            message,
+            is_gap_fill,
+            is_gap_fill,
+        )
+        .await?
         {
             VerifyResult::Passed => {}
             VerifyResult::SeqTooHigh { expected, actual } => {
@@ -328,10 +322,7 @@ impl AwaitingResendState {
         app: &mut App,
         message: &Message,
     ) -> Result<TransitionResult, SessionOperationError> {
-        match ctx
-            .verify_and_handle(&self.writer, message, false, false)
-            .await?
-        {
+        match message_handling::verify_and_handle(ctx, &self.writer, message, false, false).await? {
             VerifyResult::Passed => {}
             VerifyResult::SeqTooHigh { .. } => {}
             VerifyResult::Handled(transition) => return Ok(transition),
@@ -360,10 +351,7 @@ impl AwaitingResendState {
         app: &mut App,
         message: &Message,
     ) -> Result<TransitionResult, SessionOperationError> {
-        match ctx
-            .verify_and_handle(&self.writer, message, true, true)
-            .await?
-        {
+        match message_handling::verify_and_handle(ctx, &self.writer, message, true, true).await? {
             VerifyResult::Passed => {}
             VerifyResult::SeqTooHigh { expected, actual } => {
                 return self.handle_seq_too_high(ctx, expected, actual).await;

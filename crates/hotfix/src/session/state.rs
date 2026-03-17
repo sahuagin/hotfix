@@ -115,7 +115,7 @@ impl SessionState {
         reason: &str,
     ) {
         if let Some(writer) = self.get_writer() {
-            ctx.logout_and_terminate(writer, reason).await;
+            super::message_handling::logout_and_terminate(ctx, writer, reason).await;
         }
     }
 

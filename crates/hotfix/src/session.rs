@@ -3,6 +3,7 @@ mod ctx;
 pub mod error;
 pub(crate) mod event;
 mod info;
+mod message_handling;
 mod session_handle;
 pub mod session_ref;
 mod state;
@@ -150,8 +151,7 @@ where
             message_builder: &self.message_builder,
             message_config: &self.message_config,
         };
-        ctx.handle_invalid_parsed_message(writer, &message, reason)
-            .await
+        message_handling::handle_invalid_parsed_message(&mut ctx, writer, &message, reason).await
     }
 
     async fn dispatch_valid_message(
