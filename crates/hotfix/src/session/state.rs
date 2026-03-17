@@ -15,6 +15,7 @@ pub(crate) use disconnected::DisconnectedState;
 use crate::session::event::AwaitingActiveSessionResponse;
 use crate::session::info::Status as SessionInfoStatus;
 use crate::transport::writer::WriterRef;
+use hotfix_store::MessageStore;
 use std::time::Duration;
 use tokio::sync::oneshot;
 use tokio::time::Instant;
@@ -101,6 +102,17 @@ impl SessionState {
     pub fn notify_session_awaiter(&mut self) {
         if let SessionState::Disconnected(state) = self {
             state.notify_session_awaiter();
+        }
+    }
+
+    /// Send a logout message and immediately disconnect, if connected.
+    pub(crate) async fn logout_and_terminate<Store: MessageStore>(
+        &self,
+        ctx: &mut SessionCtx<'_, Store>,
+        reason: &str,
+    ) {
+        if let Some(writer) = self.get_writer() {
+            ctx.logout_and_terminate(writer, reason).await;
         }
     }
 

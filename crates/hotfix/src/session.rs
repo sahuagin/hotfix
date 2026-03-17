@@ -21,7 +21,6 @@ use crate::config::SessionConfig;
 use crate::message::logon::{Logon, ResetSeqNumConfig};
 use crate::message::logout::Logout;
 use crate::message::parser::RawFixMessage;
-use crate::message::reject::Reject;
 use crate::message::resend_request::ResendRequest;
 use crate::session::admin_request::AdminRequest;
 use crate::session::error::SessionCreationError;
@@ -41,7 +40,7 @@ use crate::store::MessageStore;
 use crate::transport::writer::WriterRef;
 use event::SessionEvent;
 use hotfix_message::parsed_message::{InvalidReason, ParsedMessage};
-use hotfix_message::session_fields::{MSG_SEQ_NUM, SessionRejectReason};
+use hotfix_message::session_fields::MSG_SEQ_NUM;
 
 const SCHEDULE_CHECK_INTERVAL: u64 = 1;
 
@@ -140,56 +139,12 @@ where
         message: Message,
         reason: InvalidReason,
     ) -> Result<(), SessionOperationError> {
-        let Session {
-            ref state,
-            ref mut store,
-            ref config,
-            ref message_builder,
-            ref message_config,
-            ..
-        } = *self;
-        let mut ctx = SessionCtx {
-            config,
-            store,
-            message_builder,
-            message_config,
-        };
-        let Some(writer) = state.get_writer() else {
+        let (mut ctx, writer) = self.make_ctx();
+        let Some(writer) = writer else {
             return Ok(());
         };
-
-        match reason {
-            InvalidReason::InvalidField(tag) | InvalidReason::InvalidGroup(tag) => {
-                if let Ok(msg_seq_num) = message.header().get(MSG_SEQ_NUM) {
-                    let reject = Reject::new(msg_seq_num)
-                        .session_reject_reason(SessionRejectReason::InvalidTagNumber)
-                        .text(&format!("invalid field {tag}"));
-                    ctx.send_message(writer, reject)
-                        .await
-                        .with_send_context("reject for invalid field")?;
-                }
-            }
-            InvalidReason::InvalidComponent(_component_name) => {
-                warn!("received invalid component");
-            }
-            InvalidReason::InvalidMsgType(msg_type) => {
-                ctx.handle_invalid_msg_type(writer, &message, &msg_type)
-                    .await;
-            }
-            InvalidReason::InvalidOrderInGroup { tag, .. } => {
-                if let Ok(msg_seq_num) = message.header().get(MSG_SEQ_NUM) {
-                    let reject = Reject::new(msg_seq_num)
-                        .session_reject_reason(
-                            SessionRejectReason::RepeatingGroupFieldsOutOfOrder,
-                        )
-                        .text(&format!("field appears in incorrect order:{tag}"));
-                    ctx.send_message(writer, reject)
-                        .await
-                        .with_send_context("reject for invalid group order")?;
-                }
-            }
-        }
-        Ok(())
+        ctx.handle_invalid_parsed_message(writer, &message, reason)
+            .await
     }
 
     async fn dispatch_valid_message(
@@ -352,16 +307,6 @@ where
         Ok(())
     }
 
-    /// Sends a logout message and immediately disconnects the counterparty.
-    async fn logout_and_terminate(&mut self, reason: &str) {
-        if let Err(err) = self.send_logout(reason).await {
-            warn!("failed to send logout during session termination: {}", err);
-        }
-        if let Some(writer) = self.state.get_writer() {
-            writer.disconnect().await;
-        }
-    }
-
     /// Sends a logout message and puts the session state into an AwaitingLogout state.
     async fn initiate_graceful_logout(
         &mut self,
@@ -396,7 +341,15 @@ where
                 if let Err(err) = self.on_incoming(fix_message).await {
                     let reason = err.to_string();
                     error!(reason, "fatal error in message processing");
-                    self.logout_and_terminate("internal error").await;
+                    let mut ctx = SessionCtx {
+                        config: &self.config,
+                        store: &mut self.store,
+                        message_builder: &self.message_builder,
+                        message_config: &self.message_config,
+                    };
+                    self.state
+                        .logout_and_terminate(&mut ctx, "internal error")
+                        .await;
                     self.state = SessionState::new_disconnected(true, &reason);
                 }
             }
@@ -548,7 +501,15 @@ where
                     // we are in the same period, nothing needs to be done
                 }
                 Ok(SessionPeriodComparison::DifferentPeriod) => {
-                    self.logout_and_terminate("session period changed").await;
+                    let mut ctx = SessionCtx {
+                        config: &self.config,
+                        store: &mut self.store,
+                        message_builder: &self.message_builder,
+                        message_config: &self.message_config,
+                    };
+                    self.state
+                        .logout_and_terminate(&mut ctx, "session period changed")
+                        .await;
                     if let Err(err) = self.store.reset().await {
                         error!("error resetting session store: {err:}");
                         self.state =
@@ -557,7 +518,14 @@ where
                 }
                 Ok(SessionPeriodComparison::OutsideSessionTime { .. }) => {
                     warn!("store creation time is outside session schedule, resetting store");
-                    self.logout_and_terminate("creation time outside schedule")
+                    let mut ctx = SessionCtx {
+                        config: &self.config,
+                        store: &mut self.store,
+                        message_builder: &self.message_builder,
+                        message_config: &self.message_config,
+                    };
+                    self.state
+                        .logout_and_terminate(&mut ctx, "creation time outside schedule")
                         .await;
                     if let Err(err) = self.store.reset().await {
                         error!("error resetting session store: {err:}");
@@ -567,7 +535,15 @@ where
                 }
                 Err(err) => {
                     error!("error checking session period: {err:?}");
-                    self.logout_and_terminate("internal error").await;
+                    let mut ctx = SessionCtx {
+                        config: &self.config,
+                        store: &mut self.store,
+                        message_builder: &self.message_builder,
+                        message_config: &self.message_config,
+                    };
+                    self.state
+                        .logout_and_terminate(&mut ctx, "internal error")
+                        .await;
                 }
             }
         } else if self.state.get_writer().is_some()

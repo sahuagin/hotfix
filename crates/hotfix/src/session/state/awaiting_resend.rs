@@ -435,10 +435,6 @@ impl AwaitingResendState {
                     .with_send_context("resend request")?;
                 Ok(TransitionResult::Stay)
             }
-            AwaitingResendTransitionOutcome::InvalidState(reason) => {
-                error!("failed to request resend: {reason}");
-                Ok(TransitionResult::Stay)
-            }
             AwaitingResendTransitionOutcome::BeginSeqNumberTooLow => {
                 self.writer.disconnect().await;
                 Ok(TransitionResult::TransitionTo(
@@ -461,10 +457,8 @@ impl AwaitingResendState {
     }
 }
 
-#[allow(dead_code)] // InvalidState is used only by AwaitingResendState::handle_seq_too_high and tests
 pub(crate) enum AwaitingResendTransitionOutcome {
     Success,
-    InvalidState(String),
     BeginSeqNumberTooLow,
     AttemptsExceeded,
 }

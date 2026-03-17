@@ -6,12 +6,13 @@ use crate::message::sequence_reset::SequenceReset;
 use crate::message::verification::verify_message as verify_message_impl;
 use crate::message::verification_error::{CompIdType, MessageVerificationError};
 use crate::message::{OutboundMessage, generate_message, is_admin, prepare_message_for_resend};
-use crate::session::error::{InternalSendError, SessionOperationError};
+use crate::session::error::{InternalSendError, InternalSendResultExt, SessionOperationError};
 use crate::session::get_msg_seq_num;
 use crate::session::state::SessionState;
 use crate::store::StoreError;
 use crate::transport::writer::WriterRef;
 use hotfix_message::message::{Config as MessageConfig, Message};
+use hotfix_message::parsed_message::InvalidReason;
 use hotfix_message::session_fields::{MSG_SEQ_NUM, MSG_TYPE, SessionRejectReason};
 use hotfix_message::{MessageBuilder, Part};
 use hotfix_store::MessageStore;
@@ -407,6 +408,44 @@ impl<Store: MessageStore> SessionCtx<'_, Store> {
             begin,
             end, "skipped admin message(s) during resend, requesting reset for these"
         );
+    }
+
+    pub async fn handle_invalid_parsed_message(
+        &mut self,
+        writer: &WriterRef,
+        message: &Message,
+        reason: InvalidReason,
+    ) -> Result<(), SessionOperationError> {
+        match reason {
+            InvalidReason::InvalidField(tag) | InvalidReason::InvalidGroup(tag) => {
+                if let Ok(msg_seq_num) = message.header().get(MSG_SEQ_NUM) {
+                    let reject = Reject::new(msg_seq_num)
+                        .session_reject_reason(SessionRejectReason::InvalidTagNumber)
+                        .text(&format!("invalid field {tag}"));
+                    self.send_message(writer, reject)
+                        .await
+                        .with_send_context("reject for invalid field")?;
+                }
+            }
+            InvalidReason::InvalidComponent(_component_name) => {
+                warn!("received invalid component");
+            }
+            InvalidReason::InvalidMsgType(msg_type) => {
+                self.handle_invalid_msg_type(writer, message, &msg_type)
+                    .await;
+            }
+            InvalidReason::InvalidOrderInGroup { tag, .. } => {
+                if let Ok(msg_seq_num) = message.header().get(MSG_SEQ_NUM) {
+                    let reject = Reject::new(msg_seq_num)
+                        .session_reject_reason(SessionRejectReason::RepeatingGroupFieldsOutOfOrder)
+                        .text(&format!("field appears in incorrect order:{tag}"));
+                    self.send_message(writer, reject)
+                        .await
+                        .with_send_context("reject for invalid group order")?;
+                }
+            }
+        }
+        Ok(())
     }
 
     pub async fn handle_invalid_msg_type(
