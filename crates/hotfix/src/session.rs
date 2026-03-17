@@ -19,8 +19,6 @@ use tracing::{debug, error, info, warn};
 
 use crate::Application;
 use crate::config::SessionConfig;
-use crate::message::OutboundMessage;
-use crate::message::generate_message;
 use crate::message::logon::{Logon, ResetSeqNumConfig};
 use crate::message::logout::Logout;
 use crate::message::parser::RawFixMessage;
@@ -28,7 +26,7 @@ use crate::message::reject::Reject;
 use crate::message::resend_request::ResendRequest;
 use crate::session::admin_request::AdminRequest;
 use crate::session::error::SessionCreationError;
-use crate::session::error::{InternalSendError, InternalSendResultExt, SessionOperationError};
+use crate::session::error::{InternalSendResultExt, SessionOperationError};
 pub use crate::session::error::{SendError, SendOutcome};
 pub use crate::session::info::{SessionInfo, Status};
 pub use crate::session::session_handle::SessionHandle;
@@ -38,7 +36,7 @@ pub(crate) use crate::session::session_ref::InternalSessionRef;
 pub use crate::session::session_ref::InternalSessionRef;
 use crate::session::session_ref::OutboundRequest;
 use crate::session::state::SessionState;
-use crate::session::state::{SessionCtx, TestRequestId, TransitionResult};
+use crate::session::state::{SessionCtx, TransitionResult};
 use crate::session_schedule::{SessionPeriodComparison, SessionSchedule};
 use crate::store::MessageStore;
 use crate::transport::writer::WriterRef;
@@ -112,8 +110,10 @@ where
         debug!("received message: {}", raw_message);
 
         // Reset peer timer before dispatching (if not expecting test response)
-        if !self.state.is_expecting_test_response() {
-            self.reset_peer_timer(None);
+        if let SessionState::Active(active) = &mut self.state
+            && active.expected_test_response_id().is_none()
+        {
+            active.reset_peer_timer(self.config.heartbeat_interval, None);
         }
 
         match self.message_builder.build(raw_message.as_bytes()) {
@@ -141,60 +141,52 @@ where
         message: Message,
         reason: InvalidReason,
     ) -> Result<(), SessionOperationError> {
+        let Session {
+            ref state,
+            ref mut store,
+            ref config,
+            ref message_builder,
+            ref message_config,
+            ..
+        } = *self;
+        let mut ctx = SessionCtx {
+            config,
+            store,
+            message_builder,
+            message_config,
+        };
+        let Some(writer) = state.get_writer() else {
+            return Ok(());
+        };
+
         match reason {
             InvalidReason::InvalidField(tag) | InvalidReason::InvalidGroup(tag) => {
-                match message.header().get(MSG_SEQ_NUM) {
-                    Ok(msg_seq_num) => {
-                        let reject = Reject::new(msg_seq_num)
-                            .session_reject_reason(SessionRejectReason::InvalidTagNumber)
-                            .text(&format!("invalid field {tag}"));
-                        self.send_message(reject)
-                            .await
-                            .with_send_context("reject for invalid field")?;
-                    }
-                    Err(err) => {
-                        error!("failed to get message seq num: {:?}", err);
-                    }
+                if let Ok(msg_seq_num) = message.header().get(MSG_SEQ_NUM) {
+                    let reject = Reject::new(msg_seq_num)
+                        .session_reject_reason(SessionRejectReason::InvalidTagNumber)
+                        .text(&format!("invalid field {tag}"));
+                    ctx.send_message(writer, reject)
+                        .await
+                        .with_send_context("reject for invalid field")?;
                 }
             }
             InvalidReason::InvalidComponent(_component_name) => {
                 warn!("received invalid component");
             }
             InvalidReason::InvalidMsgType(msg_type) => {
-                let Session {
-                    ref state,
-                    ref mut store,
-                    ref config,
-                    ref message_builder,
-                    ref message_config,
-                    ..
-                } = *self;
-                let mut ctx = SessionCtx {
-                    config,
-                    store,
-                    message_builder,
-                    message_config,
-                };
-                if let Some(writer) = state.get_writer() {
-                    ctx.handle_invalid_msg_type(writer, &message, &msg_type)
-                        .await;
-                }
+                ctx.handle_invalid_msg_type(writer, &message, &msg_type)
+                    .await;
             }
             InvalidReason::InvalidOrderInGroup { tag, .. } => {
-                match message.header().get(MSG_SEQ_NUM) {
-                    Ok(msg_seq_num) => {
-                        let reject = Reject::new(msg_seq_num)
-                            .session_reject_reason(
-                                SessionRejectReason::RepeatingGroupFieldsOutOfOrder,
-                            )
-                            .text(&format!("field appears in incorrect order:{tag}"));
-                        self.send_message(reject)
-                            .await
-                            .with_send_context("reject for invalid group order")?;
-                    }
-                    Err(err) => {
-                        error!("failed to get message seq num: {:?}", err);
-                    }
+                if let Ok(msg_seq_num) = message.header().get(MSG_SEQ_NUM) {
+                    let reject = Reject::new(msg_seq_num)
+                        .session_reject_reason(
+                            SessionRejectReason::RepeatingGroupFieldsOutOfOrder,
+                        )
+                        .text(&format!("field appears in incorrect order:{tag}"));
+                    ctx.send_message(writer, reject)
+                        .await
+                        .with_send_context("reject for invalid group order")?;
                 }
             }
         }
@@ -294,7 +286,8 @@ where
         if let SessionState::Disconnected(s) = &self.state {
             self.state = s.on_connect(writer, Duration::from_secs(self.config.logon_timeout));
         }
-        self.reset_peer_timer(None);
+        // Reset peer timer on the new AwaitingLogon state — no-op since it uses logon_timeout
+        // Send logon
         self.send_logon().await?;
 
         Ok(())
@@ -316,81 +309,15 @@ where
         }
     }
 
-    fn reset_heartbeat_timer(&mut self) {
-        self.state
-            .reset_heartbeat_timer(self.config.heartbeat_interval);
-    }
-
-    fn reset_peer_timer(&mut self, test_request_id: Option<TestRequestId>) {
-        self.state
-            .reset_peer_timer(self.config.heartbeat_interval, test_request_id);
-    }
-
-    /// Legacy send_app_message for non-Active connected states.
-    async fn send_app_message_legacy(
-        &mut self,
-        message: App::Outbound,
-    ) -> Result<SendOutcome, SendError> {
-        use crate::application::OutboundDecision;
-
-        match self.application.on_outbound_message(&message).await {
-            OutboundDecision::Send => {
-                let sequence_number = self.send_message(message).await?;
-                Ok(SendOutcome::Sent { sequence_number })
-            }
-            OutboundDecision::Drop => {
-                debug!("dropped outbound message as instructed by the application");
-                Ok(SendOutcome::Dropped)
-            }
-            OutboundDecision::TerminateSession => {
-                warn!("the application indicated we should terminate the session");
-                self.state.disconnect_writer().await;
-                Err(SendError::SessionTerminated)
-            }
-        }
-    }
-
-    /// Legacy send_message used by send_logon, send_logout, and error handling paths.
-    async fn send_message(
-        &mut self,
-        message: impl OutboundMessage,
-    ) -> Result<u64, InternalSendError> {
-        let seq_num = self.store.next_sender_seq_number();
-        let msg_type = message.message_type().to_string();
-        let msg = generate_message(
-            &self.config.begin_string,
-            &self.config.sender_comp_id,
-            &self.config.target_comp_id,
-            seq_num,
-            message,
-        )
-        .map_err(|e| {
-            InternalSendError::Persist(crate::store::StoreError::PersistMessage {
-                sequence_number: seq_num,
-                source: e.into(),
-            })
-        })?;
-
-        self.store
-            .increment_sender_seq_number()
-            .await
-            .map_err(InternalSendError::SequenceNumber)?;
-
-        self.store
-            .add(seq_num, &msg)
-            .await
-            .map_err(InternalSendError::Persist)?;
-
-        self.send_raw(&msg_type, msg).await;
-
-        Ok(seq_num)
-    }
-
-    async fn send_raw(&mut self, message_type: &str, data: Vec<u8>) {
-        self.state
-            .send_message(message_type, RawFixMessage::new(data))
-            .await;
-        self.reset_heartbeat_timer();
+    fn make_ctx(&mut self) -> (SessionCtx<'_, Store>, Option<&WriterRef>) {
+        let writer = self.state.get_writer();
+        let ctx = SessionCtx {
+            config: &self.config,
+            store: &mut self.store,
+            message_builder: &self.message_builder,
+            message_config: &self.message_config,
+        };
+        (ctx, writer)
     }
 
     async fn send_logon(&mut self) -> Result<(), SessionOperationError> {
@@ -403,15 +330,23 @@ where
         self.reset_on_next_logon = false;
 
         let logon = Logon::new(self.config.heartbeat_interval, reset_config);
-        self.send_message(logon).await.with_send_context("logon")?;
+        let (mut ctx, writer) = self.make_ctx();
+        if let Some(writer) = writer {
+            ctx.send_message(writer, logon)
+                .await
+                .with_send_context("logon")?;
+        }
         Ok(())
     }
 
     async fn send_logout(&mut self, reason: &str) -> Result<(), SessionOperationError> {
         let logout = Logout::with_reason(reason.to_string());
-        self.send_message(logout)
-            .await
-            .with_send_context("logout")?;
+        let (mut ctx, writer) = self.make_ctx();
+        if let Some(writer) = writer {
+            ctx.send_message(writer, logout)
+                .await
+                .with_send_context("logout")?;
+        }
         Ok(())
     }
 
@@ -420,7 +355,9 @@ where
         if let Err(err) = self.send_logout(reason).await {
             warn!("failed to send logout during session termination: {}", err);
         }
-        self.state.disconnect_writer().await;
+        if let Some(writer) = self.state.get_writer() {
+            writer.disconnect().await;
+        }
     }
 
     /// Sends a logout message and puts the session state into an AwaitingLogout state.
@@ -474,36 +411,26 @@ where
     async fn handle_outbound_message(&mut self, request: OutboundRequest<App::Outbound>) {
         let OutboundRequest { message, confirm } = request;
 
-        let is_active = matches!(self.state, SessionState::Active(_));
-        let is_connected = self.state.is_connected();
+        let Session {
+            ref mut state,
+            ref mut store,
+            ref config,
+            ref message_builder,
+            ref message_config,
+            ref mut application,
+            ..
+        } = *self;
 
-        let result = if !is_connected {
-            Err(SendError::Disconnected)
-        } else if is_active {
-            let Session {
-                ref mut state,
-                ref mut store,
-                ref config,
-                ref message_builder,
-                ref message_config,
-                ref mut application,
-                ..
-            } = *self;
-
-            if let SessionState::Active(s) = state {
-                let mut ctx = SessionCtx {
-                    config,
-                    store,
-                    message_builder,
-                    message_config,
-                };
-                s.send_app_message(&mut ctx, application, message).await
-            } else {
-                unreachable!()
-            }
+        let result = if let SessionState::Active(s) = state {
+            let mut ctx = SessionCtx {
+                config,
+                store,
+                message_builder,
+                message_config,
+            };
+            s.send_app_message(&mut ctx, application, message).await
         } else {
-            // Legacy path: session is connected but not Active (e.g. AwaitingLogon).
-            self.send_app_message_legacy(message).await
+            Err(SendError::Disconnected)
         };
 
         match confirm {
@@ -631,7 +558,7 @@ where
                     self.logout_and_terminate("internal error").await;
                 }
             }
-        } else if self.state.is_connected()
+        } else if self.state.get_writer().is_some()
             && let Err(err) = self
                 .initiate_graceful_logout("End of session time", true)
                 .await

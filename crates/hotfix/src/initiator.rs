@@ -402,9 +402,13 @@ mod tests {
             .await
             .expect("initiator should connect");
 
-        // Message should be received by session and persisted (seq 2 after Logon)
+        // Session is in AwaitingLogon (no logon response from counterparty),
+        // so send should be rejected — only Active sessions accept app messages
         let result = initiator.send(DummyMessage).await;
-        assert!(matches!(result, Ok(SendOutcome::Sent { .. })));
+        assert!(
+            matches!(result, Err(crate::session::error::SendError::Disconnected)),
+            "expected Disconnected error, got: {result:?}"
+        );
     }
 
     #[tokio::test]

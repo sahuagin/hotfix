@@ -45,7 +45,6 @@ impl DisconnectedState {
     ) -> super::SessionState {
         super::SessionState::AwaitingLogon(AwaitingLogonState {
             writer,
-            logon_sent: false,
             logon_timeout: Instant::now() + logon_timeout,
         })
     }

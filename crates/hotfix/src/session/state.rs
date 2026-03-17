@@ -13,7 +13,6 @@ pub(crate) use awaiting_resend::AwaitingResendTransitionOutcome;
 pub(crate) use disconnected::DisconnectedState;
 
 use crate::config::SessionConfig;
-use crate::message::logon::Logon;
 use crate::message::logout::Logout;
 use crate::message::parser::RawFixMessage;
 use crate::message::reject::Reject;
@@ -504,53 +503,6 @@ impl SessionState {
         }
     }
 
-    pub async fn send_message(&mut self, message_type: &str, message: RawFixMessage) {
-        match self {
-            Self::Active(ActiveState { writer, .. })
-            | Self::AwaitingResend(AwaitingResendState { writer, .. }) => {
-                if message_type == Logon::MSG_TYPE {
-                    error!("logon message is invalid for active sessions")
-                } else {
-                    writer.send_raw_message(message).await
-                }
-            }
-            Self::AwaitingLogon(AwaitingLogonState {
-                writer, logon_sent, ..
-            }) => match message_type {
-                Logon::MSG_TYPE => {
-                    if *logon_sent {
-                        error!("trying to send logon twice");
-                    } else {
-                        writer.send_raw_message(message).await;
-                        *logon_sent = true;
-                    }
-                }
-                Logout::MSG_TYPE => {
-                    writer.send_raw_message(message).await;
-                }
-                _ => error!("invalid outgoing message for AwaitingLogon state"),
-            },
-            Self::AwaitingLogout(AwaitingLogoutState { writer, .. }) => {
-                // Logout messages are allowed because we first transition into AwaitingLogout
-                // and only then send the logout message
-                if message_type == Logout::MSG_TYPE {
-                    writer.send_raw_message(message).await
-                }
-            }
-            _ => error!("trying to write without an established connection"),
-        }
-    }
-
-    pub async fn disconnect_writer(&self) {
-        match self {
-            Self::Active(ActiveState { writer, .. })
-            | Self::AwaitingLogon(AwaitingLogonState { writer, .. })
-            | Self::AwaitingLogout(AwaitingLogoutState { writer, .. })
-            | Self::AwaitingResend(AwaitingResendState { writer, .. }) => writer.disconnect().await,
-            _ => debug!("disconnecting an already disconnected session"),
-        }
-    }
-
     pub(crate) fn get_writer(&self) -> Option<&WriterRef> {
         match self {
             Self::Active(ActiveState { writer, .. })
@@ -646,12 +598,6 @@ impl SessionState {
         }
     }
 
-    pub fn reset_heartbeat_timer(&mut self, heartbeat_interval: u64) {
-        if let Self::Active(state) = self {
-            state.reset_heartbeat_timer(heartbeat_interval);
-        }
-    }
-
     pub fn peer_deadline(&self) -> Option<&Instant> {
         match self {
             Self::Active(state) => Some(state.peer_deadline()),
@@ -663,35 +609,10 @@ impl SessionState {
         }
     }
 
-    pub fn reset_peer_timer(
-        &mut self,
-        heartbeat_interval: u64,
-        test_request_id: Option<TestRequestId>,
-    ) {
-        if let Self::Active(state) = self {
-            state.reset_peer_timer(heartbeat_interval, test_request_id);
-        }
-    }
-
-    pub fn expected_test_response_id(&self) -> Option<&TestRequestId> {
-        match self {
-            Self::Active(state) => state.expected_test_response_id(),
-            _ => None,
-        }
-    }
-
-    pub fn is_connected(&self) -> bool {
-        self.get_writer().is_some()
-    }
-
     #[cfg(test)]
     pub fn is_logged_on(&self) -> bool {
         matches!(self, SessionState::Active(_))
             || matches!(self, SessionState::AwaitingResend { .. })
-    }
-
-    pub fn is_expecting_test_response(&self) -> bool {
-        self.expected_test_response_id().is_some()
     }
 
     pub fn as_status(&self) -> SessionInfoStatus {
