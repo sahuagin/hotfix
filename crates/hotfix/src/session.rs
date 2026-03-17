@@ -14,7 +14,7 @@ use std::pin::Pin;
 use tokio::select;
 use tokio::sync::mpsc;
 use tokio::time::{Duration, Instant, Sleep, sleep, sleep_until};
-use tracing::{debug, enabled, error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::Application;
 use crate::application::{InboundDecision, OutboundDecision};
@@ -31,8 +31,7 @@ use crate::message::resend_request::ResendRequest;
 use crate::message::sequence_reset::SequenceReset;
 use crate::message::test_request::TestRequest;
 use crate::message::verification::verify_message;
-use crate::message::verification_error::{CompIdType, MessageVerificationError};
-use crate::message::{is_admin, prepare_message_for_resend};
+use crate::message::verification_error::MessageVerificationError;
 use crate::session::admin_request::AdminRequest;
 use crate::session::error::SessionCreationError;
 use crate::session::error::{InternalSendError, InternalSendResultExt, SessionOperationError};
@@ -45,10 +44,7 @@ pub(crate) use crate::session::session_ref::InternalSessionRef;
 pub use crate::session::session_ref::InternalSessionRef;
 use crate::session::session_ref::OutboundRequest;
 use crate::session::state::SessionState;
-use crate::session::state::{
-    AwaitingLogonState, AwaitingLogoutState, AwaitingResendTransitionOutcome, SessionCtx,
-    TestRequestId,
-};
+use crate::session::state::{AwaitingLogonState, AwaitingLogoutState, SessionCtx, TestRequestId};
 use crate::session_schedule::{SessionPeriodComparison, SessionSchedule};
 use crate::store::MessageStore;
 use crate::transport::writer::WriterRef;
@@ -587,186 +583,42 @@ where
         &mut self,
         error: MessageVerificationError,
     ) -> Result<(), SessionOperationError> {
-        match error {
-            MessageVerificationError::SeqNumberTooLow {
-                expected,
-                actual,
-                possible_duplicate,
-            } => {
-                self.handle_sequence_number_too_low(expected, actual, possible_duplicate)
-                    .await;
-            }
-            MessageVerificationError::SeqNumberTooHigh { expected, actual } => {
-                self.handle_sequence_number_too_high(expected, actual)
-                    .await?;
-            }
-            MessageVerificationError::IncorrectBeginString(begin_string) => {
-                self.handle_incorrect_begin_string(begin_string).await;
-            }
-            MessageVerificationError::IncorrectCompId {
-                comp_id,
-                comp_id_type,
-                msg_seq_num,
-            } => {
-                self.handle_incorrect_comp_id(comp_id, comp_id_type, msg_seq_num)
-                    .await;
-            }
-            MessageVerificationError::SendingTimeAccuracyIssue { msg_seq_num } => {
-                self.handle_sending_time_accuracy_problem(msg_seq_num, "unexpected sending time")
-                    .await;
-            }
-            MessageVerificationError::SendingTimeMissing { msg_seq_num } => {
-                self.handle_sending_time_accuracy_problem(msg_seq_num, "sending time missing")
-                    .await;
-            }
-            MessageVerificationError::OriginalSendingTimeMissing { msg_seq_num } => {
-                self.handle_original_sending_time_missing(msg_seq_num).await;
-            }
-            MessageVerificationError::OriginalSendingTimeAfterSendingTime {
-                msg_seq_num, ..
-            } => {
-                self.handle_sending_time_accuracy_problem(
-                    msg_seq_num,
-                    "original sending time is after sending time",
-                )
-                .await;
-            }
-        }
-
-        Ok(())
-    }
-
-    async fn handle_incorrect_begin_string(&mut self, received_begin_string: String) {
-        self.logout_and_terminate(&format!(
-            "beginString={received_begin_string} is not supported"
-        ))
-        .await;
-    }
-
-    async fn handle_incorrect_comp_id(
-        &mut self,
-        received_comp_id: String,
-        comp_id_type: CompIdType,
-        msg_seq_num: u64,
-    ) {
-        error!(
-            "rejecting message with incorrect comp ID: {received_comp_id} (type: {comp_id_type:?})"
-        );
-        let reject = Reject::new(msg_seq_num)
-            .session_reject_reason(SessionRejectReason::ValueIsIncorrect)
-            .text(&format!("invalid comp ID {received_comp_id}"));
-        if let Err(err) = self.send_message(reject).await {
-            error!("failed to send reject message with invalid comp ID: {err}");
+        let Session {
+            ref mut state,
+            ref mut store,
+            ref config,
+            ref message_builder,
+            ref message_config,
+            ..
+        } = *self;
+        let mut ctx = SessionCtx {
+            config,
+            store,
+            message_builder,
+            message_config,
         };
-
-        self.logout_and_terminate("incorrect comp ID received")
-            .await;
-    }
-
-    async fn handle_sequence_number_too_low(
-        &mut self,
-        expected: u64,
-        actual: u64,
-        possible_duplicate: bool,
-    ) {
-        if possible_duplicate {
-            warn!(
-                "sequence number too low (expected {expected}, actual {actual}, but counterparty indicated it's poss duplicate, ignoring"
-            );
-            return;
+        if let Some(new_state) = ctx.handle_verification_error(state, error).await? {
+            *state = new_state;
         }
-        error!(
-            "we expected {expected} sequence number, but target sent lower ({actual}), terminating..."
-        );
-        let reason = format!("sequence number too low (actual {actual}, expected {expected})");
-        self.logout_and_terminate(&reason).await;
-        self.state = SessionState::new_disconnected(false, &reason);
-    }
-
-    async fn handle_sequence_number_too_high(
-        &mut self,
-        expected: u64,
-        actual: u64,
-    ) -> Result<(), SessionOperationError> {
-        match self
-            .state
-            .try_transition_to_awaiting_resend(expected, actual)
-        {
-            AwaitingResendTransitionOutcome::Success => {
-                debug!(
-                    "we are behind target (ours: {expected}, theirs: {actual}), requesting resend."
-                );
-                self.send_resend_request(expected, actual).await?;
-            }
-            AwaitingResendTransitionOutcome::InvalidState(reason) => {
-                error!("failed to request resend: {reason}");
-            }
-            AwaitingResendTransitionOutcome::BeginSeqNumberTooLow => {
-                self.state.disconnect_writer().await;
-                self.state = SessionState::new_disconnected(
-                    false,
-                    "awaiting resend begin seq number unexpectedly lower than the previous resend request's",
-                );
-            }
-            AwaitingResendTransitionOutcome::AttemptsExceeded => {
-                self.state.disconnect_writer().await;
-                self.state = SessionState::new_disconnected(
-                    false,
-                    "resend request attempts exceeded, manual intervention required",
-                );
-            }
-        }
-
         Ok(())
     }
 
     async fn handle_invalid_msg_type(&mut self, message: Message, msg_type: &str) {
-        match message.header().get(MSG_SEQ_NUM) {
-            Ok(msg_seq_num) => {
-                let reject = Reject::new(msg_seq_num)
-                    .session_reject_reason(SessionRejectReason::InvalidMsgtype)
-                    .text(&format!("invalid message type {msg_type}"));
-                if let Err(err) = self.send_message(reject).await {
-                    error!("failed to send reject message for invalid msgtype: {err}");
-                };
-
-                #[allow(clippy::collapsible_if)]
-                if let Ok(seq_num) = message.header().get::<u64>(MSG_SEQ_NUM)
-                    && self.store.next_target_seq_number() == seq_num
-                {
-                    if let Err(err) = self.store.increment_target_seq_number().await {
-                        error!("failed to increment target seq number: {:?}", err);
-                    };
-                }
-            }
-            Err(err) => {
-                error!("failed to get message seq num: {:?}", err);
-            }
-        }
-    }
-
-    async fn handle_sending_time_accuracy_problem(&mut self, msg_seq_num: u64, text: &str) {
-        let reject = Reject::new(msg_seq_num)
-            .session_reject_reason(SessionRejectReason::SendingtimeAccuracyProblem)
-            .text(text);
-        if let Err(err) = self.send_message(reject).await {
-            error!("failed to send reject for time accuracy problem: {err}");
+        let Session {
+            ref mut state,
+            ref mut store,
+            ref config,
+            ref message_builder,
+            ref message_config,
+            ..
+        } = *self;
+        let mut ctx = SessionCtx {
+            config,
+            store,
+            message_builder,
+            message_config,
         };
-        if let Err(err) = self.store.increment_target_seq_number().await {
-            error!("failed to increment target seq number: {:?}", err);
-        };
-    }
-
-    async fn handle_original_sending_time_missing(&mut self, msg_seq_num: u64) {
-        let reject = Reject::new(msg_seq_num)
-            .session_reject_reason(SessionRejectReason::RequiredTagMissing)
-            .text("original sending time is required");
-        if let Err(err) = self.send_message(reject).await {
-            error!("failed to send reject for time missing tag: {err}");
-        };
-        if let Err(err) = self.store.increment_target_seq_number().await {
-            error!("failed to increment target seq number: {:?}", err);
-        };
+        ctx.handle_invalid_msg_type(state, &message, msg_type).await;
     }
 
     async fn resend_messages(
@@ -775,77 +627,25 @@ where
         end: u64,
         _message: &Message,
     ) -> Result<(), SessionOperationError> {
-        info!(begin, end, "resending messages as requested");
-        let messages = self.store.get_slice(begin as usize, end as usize).await?;
-
-        let no = messages.len();
-        debug!(number_of_messages = no, "number of messages");
-
-        let mut reset_start: Option<u64> = None;
-        let mut sequence_number = 0;
-
-        for msg in messages {
-            let mut message = self
-                .message_builder
-                .build(msg.as_slice())
-                .into_message()
-                .ok_or_else(|| {
-                    SessionOperationError::StoredMessageParse(format!(
-                        "failed to build message for raw message: {msg:?}"
-                    ))
-                })?;
-            sequence_number = get_msg_seq_num(&message);
-            let message_type: String = message
-                .header()
-                .get::<&str>(MSG_TYPE)
-                .map_err(|_| SessionOperationError::MissingField("MSG_TYPE"))?
-                .to_string();
-
-            if is_admin(&message_type) {
-                if reset_start.is_none() {
-                    reset_start = Some(sequence_number);
-                }
-                continue;
-            }
-
-            if let Some(begin) = reset_start {
-                let end = sequence_number;
-                Self::log_skipped_admin_messages(begin, end);
-                self.send_sequence_reset(begin, end).await?;
-                reset_start = None;
-            }
-
-            if let Err(e) = prepare_message_for_resend(&mut message) {
-                error!(
-                    error = e,
-                    "failed to prepare message for resend, sending original"
-                );
-            }
-            self.send_raw(&message_type, message.encode(&self.message_config)?)
-                .await;
-
-            if enabled!(tracing::Level::DEBUG)
-                && let Ok(m) = String::from_utf8(msg.clone())
-            {
-                debug!(sequence_number, message = m, "resent message");
-            }
+        let writer = self.state.get_writer().cloned();
+        if let Some(writer) = writer {
+            let Session {
+                ref mut store,
+                ref config,
+                ref message_builder,
+                ref message_config,
+                ..
+            } = *self;
+            let mut ctx = SessionCtx {
+                config,
+                store,
+                message_builder,
+                message_config,
+            };
+            ctx.resend_messages(&writer, begin, end).await?;
+            self.reset_heartbeat_timer();
         }
-
-        if let Some(begin) = reset_start {
-            // the final reset if needed
-            let end = sequence_number;
-            Self::log_skipped_admin_messages(begin, end);
-            self.send_sequence_reset(begin, end).await?;
-        }
-
         Ok(())
-    }
-
-    fn log_skipped_admin_messages(begin: u64, end: u64) {
-        info!(
-            begin,
-            end, "skipped admin message(s) during resend, requesting reset for these"
-        );
     }
 
     fn reset_heartbeat_timer(&mut self) {
@@ -920,41 +720,6 @@ where
             .send_message(message_type, RawFixMessage::new(data))
             .await;
         self.reset_heartbeat_timer();
-    }
-
-    async fn send_sequence_reset(
-        &mut self,
-        begin: u64,
-        end: u64,
-    ) -> Result<(), SessionOperationError> {
-        let sequence_reset = SequenceReset {
-            gap_fill: true,
-            new_seq_no: end,
-        };
-        let raw_message = generate_message(
-            &self.config.begin_string,
-            &self.config.sender_comp_id,
-            &self.config.target_comp_id,
-            begin,
-            sequence_reset,
-        )?;
-
-        self.send_raw(SequenceReset::MSG_TYPE, raw_message).await;
-        debug!(begin, end, "sent reset sequence");
-
-        Ok(())
-    }
-
-    async fn send_resend_request(
-        &mut self,
-        begin: u64,
-        end: u64,
-    ) -> Result<(), SessionOperationError> {
-        let request = ResendRequest::new(begin, end);
-        self.send_message(request)
-            .await
-            .with_send_context("resend request")?;
-        Ok(())
     }
 
     async fn send_logon(&mut self) -> Result<(), SessionOperationError> {
@@ -1090,10 +855,17 @@ where
             ref mut state,
             ref mut store,
             ref config,
+            ref message_builder,
+            ref message_config,
             ..
         } = *self;
         if let SessionState::Active(active) = state {
-            let mut ctx = SessionCtx { config, store };
+            let mut ctx = SessionCtx {
+                config,
+                store,
+                message_builder,
+                message_config,
+            };
             active.on_heartbeat_timeout(&mut ctx).await;
         }
     }
@@ -1103,11 +875,18 @@ where
             ref mut state,
             ref mut store,
             ref config,
+            ref message_builder,
+            ref message_config,
             ..
         } = *self;
         let transition = match state {
             SessionState::Active(active) => {
-                let mut ctx = SessionCtx { config, store };
+                let mut ctx = SessionCtx {
+                    config,
+                    store,
+                    message_builder,
+                    message_config,
+                };
                 active.on_peer_timeout(&mut ctx).await
             }
             SessionState::AwaitingLogon(awaiting_logon) => {
@@ -1198,7 +977,7 @@ where
 /// Panics if the message does not contain a valid MsgSeqNum field.
 /// This should never happen for messages that have passed validation.
 #[allow(clippy::expect_used)]
-fn get_msg_seq_num(message: &Message) -> u64 {
+pub(crate) fn get_msg_seq_num(message: &Message) -> u64 {
     message
         .header()
         .get(MSG_SEQ_NUM)
