@@ -2,14 +2,13 @@ mod active;
 mod awaiting_logon;
 mod awaiting_logout;
 mod awaiting_resend;
-mod ctx;
 mod disconnected;
 
+pub(crate) use crate::session::ctx::{SessionCtx, TransitionResult, VerifyResult};
 pub(crate) use active::{ActiveState, calculate_peer_interval};
 pub(crate) use awaiting_logon::AwaitingLogonState;
 pub(crate) use awaiting_logout::AwaitingLogoutState;
 pub(crate) use awaiting_resend::AwaitingResendState;
-pub(crate) use ctx::{SessionCtx, TransitionResult, VerifyResult};
 pub(crate) use disconnected::DisconnectedState;
 
 use crate::session::event::AwaitingActiveSessionResponse;
