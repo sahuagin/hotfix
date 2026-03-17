@@ -10,6 +10,7 @@ use chrono::Utc;
 use hotfix_message::dict::Dictionary;
 use hotfix_message::message::{Config as MessageConfig, Message};
 use hotfix_message::{MessageBuilder, Part};
+use std::future::Future;
 use std::pin::Pin;
 use tokio::select;
 use tokio::sync::mpsc;
@@ -17,21 +18,14 @@ use tokio::time::{Duration, Instant, Sleep, sleep, sleep_until};
 use tracing::{debug, error, info, warn};
 
 use crate::Application;
-use crate::application::{InboundDecision, OutboundDecision};
 use crate::config::SessionConfig;
 use crate::message::OutboundMessage;
-use crate::message::business_reject::BusinessReject;
 use crate::message::generate_message;
-use crate::message::heartbeat::Heartbeat;
 use crate::message::logon::{Logon, ResetSeqNumConfig};
 use crate::message::logout::Logout;
 use crate::message::parser::RawFixMessage;
 use crate::message::reject::Reject;
 use crate::message::resend_request::ResendRequest;
-use crate::message::sequence_reset::SequenceReset;
-use crate::message::test_request::TestRequest;
-use crate::message::verification::verify_message;
-use crate::message::verification_error::MessageVerificationError;
 use crate::session::admin_request::AdminRequest;
 use crate::session::error::SessionCreationError;
 use crate::session::error::{InternalSendError, InternalSendResultExt, SessionOperationError};
@@ -44,16 +38,13 @@ pub(crate) use crate::session::session_ref::InternalSessionRef;
 pub use crate::session::session_ref::InternalSessionRef;
 use crate::session::session_ref::OutboundRequest;
 use crate::session::state::SessionState;
-use crate::session::state::{AwaitingLogonState, AwaitingLogoutState, SessionCtx, TestRequestId};
+use crate::session::state::{SessionCtx, TestRequestId, TransitionResult};
 use crate::session_schedule::{SessionPeriodComparison, SessionSchedule};
 use crate::store::MessageStore;
 use crate::transport::writer::WriterRef;
 use event::SessionEvent;
 use hotfix_message::parsed_message::{InvalidReason, ParsedMessage};
-use hotfix_message::session_fields::{
-    BEGIN_SEQ_NO, END_SEQ_NO, GAP_FILL_FLAG, MSG_SEQ_NUM, MSG_TYPE, NEW_SEQ_NO,
-    SessionRejectReason, TEST_REQ_ID,
-};
+use hotfix_message::session_fields::{MSG_SEQ_NUM, SessionRejectReason};
 
 const SCHEDULE_CHECK_INTERVAL: u64 = 1;
 
@@ -119,64 +110,24 @@ where
         raw_message: RawFixMessage,
     ) -> Result<(), SessionOperationError> {
         debug!("received message: {}", raw_message);
+
+        // Reset peer timer before dispatching (if not expecting test response)
         if !self.state.is_expecting_test_response() {
-            // if we are not awaiting a specific test response, any message can reset the timer
-            // otherwise only a heartbeat with the corresponding TestReqID can
             self.reset_peer_timer(None);
         }
 
         match self.message_builder.build(raw_message.as_bytes()) {
             ParsedMessage::Valid(message) => {
-                self.process_message(message).await?;
-                self.check_end_of_resend().await?;
+                self.dispatch_valid_message(message).await?;
             }
             ParsedMessage::Garbled(r) => {
-                // garbled messages should be skipped and we should assume it was a transmission error
                 let message = raw_message.to_string();
                 let reason = format!("{r:?}");
                 error!(message, reason, "received garbled message");
             }
-            ParsedMessage::Invalid { message, reason } => match reason {
-                InvalidReason::InvalidField(tag) | InvalidReason::InvalidGroup(tag) => {
-                    match message.header().get(MSG_SEQ_NUM) {
-                        Ok(msg_seq_num) => {
-                            let reject = Reject::new(msg_seq_num)
-                                .session_reject_reason(SessionRejectReason::InvalidTagNumber)
-                                .text(&format!("invalid field {tag}"));
-                            self.send_message(reject)
-                                .await
-                                .with_send_context("reject for invalid field")?;
-                        }
-                        Err(err) => {
-                            error!("failed to get message seq num: {:?}", err);
-                        }
-                    }
-                }
-                InvalidReason::InvalidComponent(_component_name) => {
-                    // TODO: what's the correct way to handle this?
-                    warn!("received invalid component");
-                }
-                InvalidReason::InvalidMsgType(msg_type) => {
-                    self.handle_invalid_msg_type(message, &msg_type).await;
-                }
-                InvalidReason::InvalidOrderInGroup { tag, .. } => {
-                    match message.header().get(MSG_SEQ_NUM) {
-                        Ok(msg_seq_num) => {
-                            let reject = Reject::new(msg_seq_num)
-                                .session_reject_reason(
-                                    SessionRejectReason::RepeatingGroupFieldsOutOfOrder,
-                                )
-                                .text(&format!("field appears in incorrect order:{tag}"));
-                            self.send_message(reject)
-                                .await
-                                .with_send_context("reject for invalid group order")?;
-                        }
-                        Err(err) => {
-                            error!("failed to get message seq num: {:?}", err);
-                        }
-                    }
-                }
-            },
+            ParsedMessage::Invalid { message, reason } => {
+                self.handle_invalid_parsed_message(message, reason).await?;
+            }
             ParsedMessage::UnexpectedError(err) => {
                 error!("unexpected error: {:?}", err);
             }
@@ -185,149 +136,158 @@ where
         Ok(())
     }
 
-    async fn process_message(&mut self, message: Message) -> Result<(), SessionOperationError> {
-        let message_type: &str = message
-            .header()
-            .get(MSG_TYPE)
-            .map_err(|_| SessionOperationError::MissingField("MSG_TYPE"))?;
-
-        if let SessionState::AwaitingResend(state) = &mut self.state {
-            let seq_number = get_msg_seq_num(&message);
-            if seq_number > state.end_seq_number && message_type != ResendRequest::MSG_TYPE {
-                state.inbound_queue.push_back(message);
-                return Ok(());
-            }
-        }
-
-        if let SessionState::AwaitingLogon(_) = &mut self.state {
-            // TODO: should this (and all inbound message processing) logic be pushed into the state?
-            if message_type != Logon::MSG_TYPE {
-                self.state.disconnect_writer().await;
-                return Ok(());
-            }
-        }
-
-        match message_type {
-            Heartbeat::MSG_TYPE => {
-                self.on_heartbeat(&message).await?;
-            }
-            TestRequest::MSG_TYPE => {
-                self.on_test_request(&message).await?;
-            }
-            ResendRequest::MSG_TYPE => {
-                self.on_resend_request(&message).await?;
-            }
-            Reject::MSG_TYPE => {
-                self.on_reject(&message).await?;
-            }
-            SequenceReset::MSG_TYPE => {
-                self.on_sequence_reset(&message).await?;
-            }
-            Logout::MSG_TYPE => {
-                self.on_logout(&message).await?;
-            }
-            Logon::MSG_TYPE => {
-                self.on_logon(&message).await?;
-            }
-            _ => self.process_app_message(&message).await?,
-        }
-
-        Ok(())
-    }
-
-    async fn process_app_message(
+    async fn handle_invalid_parsed_message(
         &mut self,
-        message: &Message,
+        message: Message,
+        reason: InvalidReason,
     ) -> Result<(), SessionOperationError> {
-        match self.verify_message(message, true, true) {
-            Ok(_) => {
-                match self.application.on_inbound_message(message).await {
-                    InboundDecision::Accept => {}
-                    InboundDecision::Reject { reason, text } => {
-                        let msg_type: &str = message
-                            .header()
-                            .get(MSG_TYPE)
-                            .map_err(|_| SessionOperationError::MissingField("MSG_TYPE"))?;
-                        let mut reject = BusinessReject::new(msg_type, reason)
-                            .ref_seq_num(get_msg_seq_num(message));
-                        if let Some(text) = text {
-                            reject = reject.text(&text);
-                        }
+        match reason {
+            InvalidReason::InvalidField(tag) | InvalidReason::InvalidGroup(tag) => {
+                match message.header().get(MSG_SEQ_NUM) {
+                    Ok(msg_seq_num) => {
+                        let reject = Reject::new(msg_seq_num)
+                            .session_reject_reason(SessionRejectReason::InvalidTagNumber)
+                            .text(&format!("invalid field {tag}"));
                         self.send_message(reject)
                             .await
-                            .with_send_context("business message reject")?;
+                            .with_send_context("reject for invalid field")?;
                     }
-                    InboundDecision::TerminateSession => {
-                        error!("failed to send inbound message to application");
-                        self.state.disconnect_writer().await;
+                    Err(err) => {
+                        error!("failed to get message seq num: {:?}", err);
                     }
                 }
-                self.store.increment_target_seq_number().await?;
             }
-            Err(err) => self.handle_verification_error(err).await?,
+            InvalidReason::InvalidComponent(_component_name) => {
+                warn!("received invalid component");
+            }
+            InvalidReason::InvalidMsgType(msg_type) => {
+                let Session {
+                    ref state,
+                    ref mut store,
+                    ref config,
+                    ref message_builder,
+                    ref message_config,
+                    ..
+                } = *self;
+                let mut ctx = SessionCtx {
+                    config,
+                    store,
+                    message_builder,
+                    message_config,
+                };
+                if let Some(writer) = state.get_writer() {
+                    ctx.handle_invalid_msg_type(writer, &message, &msg_type)
+                        .await;
+                }
+            }
+            InvalidReason::InvalidOrderInGroup { tag, .. } => {
+                match message.header().get(MSG_SEQ_NUM) {
+                    Ok(msg_seq_num) => {
+                        let reject = Reject::new(msg_seq_num)
+                            .session_reject_reason(
+                                SessionRejectReason::RepeatingGroupFieldsOutOfOrder,
+                            )
+                            .text(&format!("field appears in incorrect order:{tag}"));
+                        self.send_message(reject)
+                            .await
+                            .with_send_context("reject for invalid group order")?;
+                    }
+                    Err(err) => {
+                        error!("failed to get message seq num: {:?}", err);
+                    }
+                }
+            }
         }
-
         Ok(())
     }
 
-    async fn check_end_of_resend(&mut self) -> Result<(), SessionOperationError> {
-        let ended_state = if let SessionState::AwaitingResend(state) = &mut self.state {
-            if self.store.next_target_seq_number() > state.end_seq_number {
-                let new_state =
-                    SessionState::new_active(state.writer.clone(), self.config.heartbeat_interval);
-                Some(std::mem::replace(&mut self.state, new_state))
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
-        if let Some(SessionState::AwaitingResend(mut state)) = ended_state {
-            // we have reached the end of the resend,
-            // process queued messages and resume normal operation
-            debug!("resend is done, processing backlog");
-            while let Some(msg) = state.inbound_queue.pop_front() {
-                let seq_number: u64 = msg.get(MSG_SEQ_NUM).unwrap_or_else(|e| {
-                    error!("failed to get seq number: {:?}", e);
-                    0
-                });
-                let msg_type: &str = msg.header().get(MSG_TYPE).unwrap_or("");
-                debug!(seq_number, msg_type, "processing queued message");
-
-                if msg_type == ResendRequest::MSG_TYPE {
-                    // ResendRequest was already processed when it arrived (it bypasses
-                    // the queue in process_message). Just increment the target seq number
-                    // for sequence accounting purposes.
-                    self.store.increment_target_seq_number().await?;
-                } else {
-                    self.process_message(msg).await?;
-                }
-            }
-            debug!("resend backlog is cleared, resuming normal operation");
-        }
-
-        Ok(())
+    fn dispatch_valid_message(
+        &mut self,
+        message: Message,
+    ) -> Pin<Box<dyn Future<Output = Result<(), SessionOperationError>> + Send + '_>> {
+        Box::pin(self.dispatch_valid_message_inner(message))
     }
 
-    fn verify_message(
-        &self,
-        message: &Message,
-        check_too_high: bool,
-        check_too_low: bool,
-    ) -> Result<(), MessageVerificationError> {
-        let expected_seq_number = if check_too_high || check_too_low {
-            Some(self.store.next_target_seq_number())
-        } else {
-            None
+    async fn dispatch_valid_message_inner(
+        &mut self,
+        message: Message,
+    ) -> Result<(), SessionOperationError> {
+        let Session {
+            ref mut state,
+            ref mut store,
+            ref config,
+            ref message_builder,
+            ref message_config,
+            ref mut application,
+            ..
+        } = *self;
+
+        let mut ctx = SessionCtx {
+            config,
+            store,
+            message_builder,
+            message_config,
         };
-        verify_message(
-            message,
-            &self.config,
-            expected_seq_number,
-            check_too_high,
-            check_too_low,
-        )
+
+        let transition = match state {
+            SessionState::Active(s) => s.on_fix_message(&mut ctx, application, message).await?,
+            SessionState::AwaitingLogon(s) => {
+                s.on_fix_message(&mut ctx, application, message).await?
+            }
+            SessionState::AwaitingResend(s) => {
+                s.on_fix_message(&mut ctx, application, message).await?
+            }
+            SessionState::AwaitingLogout(s) => {
+                s.on_fix_message(&mut ctx, application, message).await?
+            }
+            SessionState::Disconnected(_) => TransitionResult::Stay,
+        };
+
+        // Let ctx go out of scope before we can mutate self.state
+        let _ = ctx;
+
+        self.apply_transition(transition).await
+    }
+
+    async fn apply_transition(
+        &mut self,
+        transition: TransitionResult,
+    ) -> Result<(), SessionOperationError> {
+        match transition {
+            TransitionResult::Stay => {}
+            TransitionResult::TransitionTo(new_state) => {
+                self.state = new_state;
+            }
+            TransitionResult::TransitionWithBacklog {
+                new_state,
+                mut backlog,
+            } => {
+                self.state = new_state;
+                debug!("resend is done, processing backlog");
+                while let Some(msg) = backlog.pop_front() {
+                    let seq_number: u64 = msg.get(MSG_SEQ_NUM).unwrap_or_else(|e| {
+                        error!("failed to get seq number: {:?}", e);
+                        0
+                    });
+                    let msg_type: &str = msg
+                        .header()
+                        .get(hotfix_message::session_fields::MSG_TYPE)
+                        .unwrap_or("");
+                    debug!(seq_number, msg_type, "processing queued message");
+
+                    if msg_type == ResendRequest::MSG_TYPE {
+                        // ResendRequest was already processed when it arrived (it bypasses
+                        // the queue). Just increment the target seq number
+                        // for sequence accounting purposes.
+                        self.store.increment_target_seq_number().await?;
+                    } else {
+                        self.dispatch_valid_message(msg).await?;
+                    }
+                }
+                debug!("resend backlog is cleared, resuming normal operation");
+            }
+        }
+        Ok(())
     }
 
     async fn on_connect(&mut self, writer: WriterRef) -> Result<(), SessionOperationError> {
@@ -356,298 +316,6 @@ where
         }
     }
 
-    async fn on_logon(&mut self, message: &Message) -> Result<(), SessionOperationError> {
-        if let SessionState::AwaitingLogon(AwaitingLogonState { writer, .. }) = &self.state {
-            match self.verify_message(message, true, true) {
-                Ok(_) => {
-                    // happy logon flow, the session is now active
-                    self.state =
-                        SessionState::new_active(writer.clone(), self.config.heartbeat_interval);
-                    self.application.on_logon().await;
-                    self.store.increment_target_seq_number().await?;
-                }
-                Err(err) => self.handle_verification_error(err).await?,
-            }
-        } else {
-            error!("received unexpected logon message");
-        }
-
-        Ok(())
-    }
-
-    async fn on_logout(&mut self, message: &Message) -> Result<(), SessionOperationError> {
-        if let Err(err) = self.verify_message(message, false, false) {
-            self.handle_verification_error(err).await?;
-            return Ok(());
-        }
-
-        if self.state.is_logged_on() {
-            self.send_logout("Logout acknowledged").await?;
-        }
-
-        self.application.on_logout("peer has logged us out").await;
-
-        match self.state {
-            // if the session is already disconnected, we have nothing else to do
-            SessionState::Disconnected(..) => {}
-            // if we initiated the logout, preserve the reconnect flag
-            SessionState::AwaitingLogout(AwaitingLogoutState { reconnect, .. }) => {
-                self.state.disconnect_writer().await;
-                self.state = SessionState::new_disconnected(reconnect, "logout completed");
-            }
-            // otherwise assume it makes sense to try to reconnect
-            _ => {
-                self.state.disconnect_writer().await;
-                self.state = SessionState::new_disconnected(true, "peer has logged us out")
-            }
-        }
-
-        self.store.increment_target_seq_number().await?;
-        Ok(())
-    }
-
-    async fn on_heartbeat(&mut self, message: &Message) -> Result<(), SessionOperationError> {
-        if let Err(err) = self.verify_message(message, true, true) {
-            self.handle_verification_error(err).await?;
-            return Ok(());
-        }
-
-        if let (Some(expected_req_id), Ok(message_req_id)) = (
-            &self.state.expected_test_response_id(),
-            message.get::<&str>(TEST_REQ_ID),
-        ) && expected_req_id.as_str() == message_req_id
-        {
-            debug!("received response for TestRequest, resetting timer");
-            self.reset_peer_timer(None);
-        }
-
-        self.store.increment_target_seq_number().await?;
-        Ok(())
-    }
-
-    async fn on_test_request(&mut self, message: &Message) -> Result<(), SessionOperationError> {
-        if let Err(err) = self.verify_message(message, true, true) {
-            self.handle_verification_error(err).await?;
-            return Ok(());
-        }
-
-        let req_id: &str = message.get(TEST_REQ_ID).unwrap_or_else(|_| {
-            // TODO: send reject?
-            todo!()
-        });
-
-        self.store.increment_target_seq_number().await?;
-
-        self.send_message(Heartbeat::for_request(req_id.to_string()))
-            .await
-            .with_send_context("heartbeat response")?;
-
-        Ok(())
-    }
-
-    async fn on_resend_request(&mut self, message: &Message) -> Result<(), SessionOperationError> {
-        if !self.state.is_connected() {
-            warn!("received resend request while disconnected, ignoring");
-            return Ok(());
-        }
-
-        // Verify with check_too_high=false so ResendRequest is never blocked by seq-too-high.
-        // This is the key part of the QFJ-673 deadlock fix: when both sides send ResendRequest
-        // simultaneously, each side's ResendRequest will have a seq number higher than expected.
-        // By not treating that as an error, we allow the ResendRequest to be processed.
-        match self.verify_message(message, false, true) {
-            Ok(_) => {}
-            Err(err) => {
-                self.handle_verification_error(err).await?;
-                return Ok(());
-            }
-        }
-
-        let msg_seq_num = get_msg_seq_num(message);
-        let expected = self.store.next_target_seq_number();
-
-        // If seq is too high and we're in AwaitingResend, queue it for seq accounting
-        // when the gap fill catches up, but still process the resend below.
-        if msg_seq_num > expected
-            && let SessionState::AwaitingResend(state) = &mut self.state
-        {
-            state.inbound_queue.push_back(message.clone());
-        }
-
-        let begin_seq_number: u64 = match message.get(BEGIN_SEQ_NO) {
-            Ok(seq_number) => seq_number,
-            Err(_) => {
-                let reject = Reject::new(msg_seq_num)
-                    .session_reject_reason(SessionRejectReason::RequiredTagMissing)
-                    .text("missing begin sequence number for resend request");
-                self.send_message(reject)
-                    .await
-                    .with_send_context("reject for missing BEGIN_SEQ_NO")?;
-                return Ok(());
-            }
-        };
-
-        let end_seq_number: u64 = match message.get(END_SEQ_NO) {
-            Ok(seq_number) => {
-                let last_seq_number = self.store.next_sender_seq_number() - 1;
-                if seq_number == 0 {
-                    last_seq_number
-                } else {
-                    std::cmp::min(seq_number, last_seq_number)
-                }
-            }
-            Err(_) => {
-                let reject = Reject::new(msg_seq_num)
-                    .session_reject_reason(SessionRejectReason::RequiredTagMissing)
-                    .text("missing end sequence number for resend request");
-                self.send_message(reject)
-                    .await
-                    .with_send_context("reject for missing END_SEQ_NO")?;
-                return Ok(());
-            }
-        };
-
-        // Only increment target seq if seq matches expected
-        if msg_seq_num == expected {
-            self.store.increment_target_seq_number().await?;
-        }
-
-        self.resend_messages(begin_seq_number, end_seq_number, message)
-            .await?;
-
-        Ok(())
-    }
-
-    /// Handle Reject messages.
-    async fn on_reject(&mut self, message: &Message) -> Result<(), SessionOperationError> {
-        if let Err(err) = self.verify_message(message, false, true) {
-            self.handle_verification_error(err).await?;
-            return Ok(());
-        }
-
-        self.store.increment_target_seq_number().await?;
-        Ok(())
-    }
-
-    async fn on_sequence_reset(&mut self, message: &Message) -> Result<(), SessionOperationError> {
-        let msg_seq_num = get_msg_seq_num(message);
-        let is_gap_fill: bool = message.get(GAP_FILL_FLAG).unwrap_or(false);
-        if let Err(err) = self.verify_message(message, is_gap_fill, is_gap_fill) {
-            self.handle_verification_error(err).await?;
-            return Ok(());
-        }
-
-        let end: u64 = match message.get(NEW_SEQ_NO) {
-            Ok(new_seq_no) => new_seq_no,
-            Err(err) => {
-                error!(
-                    "received sequence reset message without new sequence number: {:?}",
-                    err
-                );
-                let reject = Reject::new(msg_seq_num)
-                    .session_reject_reason(SessionRejectReason::RequiredTagMissing)
-                    .text("missing NewSeqNo tag in sequence reset message");
-                self.send_message(reject)
-                    .await
-                    .with_send_context("reject for missing NEW_SEQ_NO")?;
-
-                // note: we don't increment the target seq number here
-                // this is an ambiguous case in the specification, but leaving the
-                // sequence number as is feels the safest
-                return Ok(());
-            }
-        };
-
-        // sequence resets cannot move the target seq number backwards
-        // regardless of whether the message is a gap fill or not
-        if end <= self.store.next_target_seq_number() {
-            error!(
-                "received sequence reset message which would move target seq number backwards: {end}",
-            );
-            let text =
-                format!("attempt to lower sequence number, invalid value NewSeqNo(36)={end}");
-            let reject = Reject::new(msg_seq_num)
-                .session_reject_reason(SessionRejectReason::ValueIsIncorrect)
-                .text(&text);
-            self.send_message(reject)
-                .await
-                .with_send_context("reject for invalid sequence reset")?;
-            return Ok(());
-        }
-
-        self.store.set_target_seq_number(end - 1).await?;
-        Ok(())
-    }
-
-    async fn handle_verification_error(
-        &mut self,
-        error: MessageVerificationError,
-    ) -> Result<(), SessionOperationError> {
-        let Session {
-            ref mut state,
-            ref mut store,
-            ref config,
-            ref message_builder,
-            ref message_config,
-            ..
-        } = *self;
-        let mut ctx = SessionCtx {
-            config,
-            store,
-            message_builder,
-            message_config,
-        };
-        if let Some(new_state) = ctx.handle_verification_error(state, error).await? {
-            *state = new_state;
-        }
-        Ok(())
-    }
-
-    async fn handle_invalid_msg_type(&mut self, message: Message, msg_type: &str) {
-        let Session {
-            ref mut state,
-            ref mut store,
-            ref config,
-            ref message_builder,
-            ref message_config,
-            ..
-        } = *self;
-        let mut ctx = SessionCtx {
-            config,
-            store,
-            message_builder,
-            message_config,
-        };
-        ctx.handle_invalid_msg_type(state, &message, msg_type).await;
-    }
-
-    async fn resend_messages(
-        &mut self,
-        begin: u64,
-        end: u64,
-        _message: &Message,
-    ) -> Result<(), SessionOperationError> {
-        let writer = self.state.get_writer().cloned();
-        if let Some(writer) = writer {
-            let Session {
-                ref mut store,
-                ref config,
-                ref message_builder,
-                ref message_config,
-                ..
-            } = *self;
-            let mut ctx = SessionCtx {
-                config,
-                store,
-                message_builder,
-                message_config,
-            };
-            ctx.resend_messages(&writer, begin, end).await?;
-            self.reset_heartbeat_timer();
-        }
-        Ok(())
-    }
-
     fn reset_heartbeat_timer(&mut self) {
         self.state
             .reset_heartbeat_timer(self.config.heartbeat_interval);
@@ -658,10 +326,12 @@ where
             .reset_peer_timer(self.config.heartbeat_interval, test_request_id);
     }
 
-    async fn send_app_message(&mut self, message: App::Outbound) -> Result<SendOutcome, SendError> {
-        if !self.state.is_connected() {
-            return Err(SendError::Disconnected);
-        }
+    /// Legacy send_app_message for non-Active connected states.
+    async fn send_app_message_legacy(
+        &mut self,
+        message: App::Outbound,
+    ) -> Result<SendOutcome, SendError> {
+        use crate::application::OutboundDecision;
 
         match self.application.on_outbound_message(&message).await {
             OutboundDecision::Send => {
@@ -680,6 +350,7 @@ where
         }
     }
 
+    /// Legacy send_message used by send_logon, send_logout, and error handling paths.
     async fn send_message(
         &mut self,
         message: impl OutboundMessage,
@@ -745,12 +416,6 @@ where
     }
 
     /// Sends a logout message and immediately disconnects the counterparty.
-    ///
-    /// This should be used sparingly in scenarios where there is a major issue
-    /// requiring operational intervention, such as the sequence number being lower
-    /// than expected, or some other key header field containing an invalid value.
-    ///
-    /// In other scenarios, [`initiate_graceful_logout`] should be preferred.
     async fn logout_and_terminate(&mut self, reason: &str) {
         if let Err(err) = self.send_logout(reason).await {
             warn!("failed to send logout during session termination: {}", err);
@@ -758,11 +423,7 @@ where
         self.state.disconnect_writer().await;
     }
 
-    /// Sends a logout message and puts the session state into an [`AwaitingLogout`] state.
-    ///
-    /// The session waits for a configurable timeout period for the counterparty to
-    /// respond with a `Logout` message. If no response is received within the timeout
-    /// period, it disconnects the counterparty.
+    /// Sends a logout message and puts the session state into an AwaitingLogout state.
     async fn initiate_graceful_logout(
         &mut self,
         reason: &str,
@@ -812,10 +473,41 @@ where
 
     async fn handle_outbound_message(&mut self, request: OutboundRequest<App::Outbound>) {
         let OutboundRequest { message, confirm } = request;
-        let result = self.send_app_message(message).await;
+
+        let is_active = matches!(self.state, SessionState::Active(_));
+        let is_connected = self.state.is_connected();
+
+        let result = if !is_connected {
+            Err(SendError::Disconnected)
+        } else if is_active {
+            let Session {
+                ref mut state,
+                ref mut store,
+                ref config,
+                ref message_builder,
+                ref message_config,
+                ref mut application,
+                ..
+            } = *self;
+
+            if let SessionState::Active(s) = state {
+                let mut ctx = SessionCtx {
+                    config,
+                    store,
+                    message_builder,
+                    message_config,
+                };
+                s.send_app_message(&mut ctx, application, message).await
+            } else {
+                unreachable!()
+            }
+        } else {
+            // Legacy path: session is connected but not Active (e.g. AwaitingLogon).
+            self.send_app_message_legacy(message).await
+        };
+
         match confirm {
             Some(tx) => {
-                // Ignore send errors - receiver may have been dropped
                 let _ = tx.send(result);
             }
             None => {
@@ -917,8 +609,6 @@ where
                     // we are in the same period, nothing needs to be done
                 }
                 Ok(SessionPeriodComparison::DifferentPeriod) => {
-                    // the message store is for a previous session,
-                    // we need to terminate this session, reset the store, and reestablish the session
                     self.logout_and_terminate("session period changed").await;
                     if let Err(err) = self.store.reset().await {
                         error!("error resetting session store: {err:}");
@@ -927,8 +617,6 @@ where
                     }
                 }
                 Ok(SessionPeriodComparison::OutsideSessionTime { .. }) => {
-                    // the creation_time was recorded outside the session schedule,
-                    // treat this similarly to a different period - reset the store
                     warn!("store creation time is outside session schedule, resetting store");
                     self.logout_and_terminate("creation time outside schedule")
                         .await;
@@ -939,22 +627,18 @@ where
                     }
                 }
                 Err(err) => {
-                    // actual schedule calculation error (e.g., DST transition, date overflow)
                     error!("error checking session period: {err:?}");
                     self.logout_and_terminate("internal error").await;
                 }
             }
-        } else if self.state.is_connected() {
-            // we are currently outside scheduled session time
-            if let Err(err) = self
+        } else if self.state.is_connected()
+            && let Err(err) = self
                 .initiate_graceful_logout("End of session time", true)
                 .await
-            {
-                error!(err = ?err, "failed to initiate graceful logout");
-            }
+        {
+            error!(err = ?err, "failed to initiate graceful logout");
         }
 
-        // we always need to reschedule the check, otherwise we won't be able to resume an inactive session
         let deadline = Instant::now() + Duration::from_secs(SCHEDULE_CHECK_INTERVAL);
         self.schedule_check_timer.as_mut().reset(deadline);
     }
@@ -969,9 +653,6 @@ where
 }
 
 /// Extracts MsgSeqNum from a message header.
-///
-/// To be removed once https://github.com/Validus-Risk-Management/hotfix/issues/301
-/// is implemented.
 ///
 /// # Panics
 /// Panics if the message does not contain a valid MsgSeqNum field.
@@ -1282,8 +963,6 @@ mod tests {
         session.handle_schedule_check().await;
 
         // Store reset should have been called (indicates DifferentPeriod branch was taken)
-        // Note: logout_and_terminate disconnects the writer but state transition to
-        // Disconnected happens asynchronously via event processing, not in this call
         assert!(
             session.store.was_reset_called(),
             "Store reset should be called for different period"
@@ -1348,7 +1027,6 @@ mod tests {
         let state = SessionState::new_active(writer, 30);
 
         // Creation time is today but at a time outside the schedule window
-        // Use a time that's definitely outside the window (6 hours from now)
         let outside_hour = (current_hour + 6) % 24;
         let creation_time = DateTime::from_naive_utc_and_offset(
             NaiveDate::from_ymd_opt(now.year(), now.month(), now.day())

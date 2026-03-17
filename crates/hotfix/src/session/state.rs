@@ -7,7 +7,9 @@ mod disconnected;
 pub(crate) use active::{ActiveState, calculate_peer_interval};
 pub(crate) use awaiting_logon::AwaitingLogonState;
 pub(crate) use awaiting_logout::AwaitingLogoutState;
-pub(crate) use awaiting_resend::{AwaitingResendState, AwaitingResendTransitionOutcome};
+pub(crate) use awaiting_resend::AwaitingResendState;
+#[cfg(test)]
+pub(crate) use awaiting_resend::AwaitingResendTransitionOutcome;
 pub(crate) use disconnected::DisconnectedState;
 
 use crate::config::SessionConfig;
@@ -15,12 +17,11 @@ use crate::message::logon::Logon;
 use crate::message::logout::Logout;
 use crate::message::parser::RawFixMessage;
 use crate::message::reject::Reject;
-use crate::message::resend_request::ResendRequest;
 use crate::message::sequence_reset::SequenceReset;
 use crate::message::verification::verify_message as verify_message_impl;
 use crate::message::verification_error::{CompIdType, MessageVerificationError};
 use crate::message::{OutboundMessage, generate_message, is_admin, prepare_message_for_resend};
-use crate::session::error::{InternalSendError, InternalSendResultExt, SessionOperationError};
+use crate::session::error::{InternalSendError, SessionOperationError};
 use crate::session::event::AwaitingActiveSessionResponse;
 use crate::session::get_msg_seq_num;
 use crate::session::info::Status as SessionInfoStatus;
@@ -30,6 +31,7 @@ use hotfix_message::message::{Config as MessageConfig, Message};
 use hotfix_message::session_fields::SessionRejectReason;
 use hotfix_message::{MessageBuilder, Part};
 use hotfix_store::MessageStore;
+use std::collections::VecDeque;
 use std::time::Duration;
 use tokio::sync::oneshot;
 use tokio::time::Instant;
@@ -46,9 +48,24 @@ pub(crate) struct SessionCtx<'a, Store> {
 
 pub(crate) struct PreparedMessage {
     pub seq_num: u64,
-    #[allow(dead_code)] // used in later sub-phases
+    #[allow(dead_code)]
     pub msg_type: String,
     pub raw: RawFixMessage,
+}
+
+pub(crate) enum TransitionResult {
+    Stay,
+    TransitionTo(SessionState),
+    TransitionWithBacklog {
+        new_state: SessionState,
+        backlog: VecDeque<Message>,
+    },
+}
+
+pub(crate) enum VerifyResult {
+    Passed,
+    SeqTooHigh { expected: u64, actual: u64 },
+    ErrorHandled(Option<SessionState>),
 }
 
 impl<Store: MessageStore> SessionCtx<'_, Store> {
@@ -99,7 +116,6 @@ impl<Store: MessageStore> SessionCtx<'_, Store> {
         Ok(prepared.seq_num)
     }
 
-    #[allow(dead_code)] // used when states handle their own messages in 2e
     pub fn verify_message(
         &self,
         message: &Message,
@@ -120,10 +136,33 @@ impl<Store: MessageStore> SessionCtx<'_, Store> {
         )
     }
 
-    /// Handle a verification error. Returns `Some(new_state)` if a state transition is needed.
+    /// Verify a message and handle the error if verification fails.
+    /// For SeqNumberTooHigh, returns `VerifyResult::SeqTooHigh` instead of handling it,
+    /// allowing the caller to handle the transition.
+    pub async fn verify_and_handle(
+        &mut self,
+        writer: &WriterRef,
+        message: &Message,
+        check_too_high: bool,
+        check_too_low: bool,
+    ) -> Result<VerifyResult, SessionOperationError> {
+        match self.verify_message(message, check_too_high, check_too_low) {
+            Ok(()) => Ok(VerifyResult::Passed),
+            Err(MessageVerificationError::SeqNumberTooHigh { expected, actual }) => {
+                Ok(VerifyResult::SeqTooHigh { expected, actual })
+            }
+            Err(err) => {
+                let transition = self.handle_verification_error(writer, err).await?;
+                Ok(VerifyResult::ErrorHandled(transition))
+            }
+        }
+    }
+
+    /// Handle a verification error (excluding SeqNumberTooHigh which is returned separately).
+    /// Returns `Some(new_state)` if a state transition is needed.
     pub async fn handle_verification_error(
         &mut self,
-        state: &mut SessionState,
+        writer: &WriterRef,
         error: MessageVerificationError,
     ) -> Result<Option<SessionState>, SessionOperationError> {
         match error {
@@ -132,14 +171,18 @@ impl<Store: MessageStore> SessionCtx<'_, Store> {
                 actual,
                 possible_duplicate,
             } => Ok(self
-                .handle_sequence_number_too_low(state, expected, actual, possible_duplicate)
+                .handle_sequence_number_too_low(writer, expected, actual, possible_duplicate)
                 .await),
             MessageVerificationError::SeqNumberTooHigh { expected, actual } => {
-                self.handle_sequence_number_too_high(state, expected, actual)
-                    .await
+                // This shouldn't be called for SeqTooHigh anymore (it's returned via VerifyResult),
+                // but handle gracefully if it is.
+                warn!(
+                    "handle_verification_error called with SeqNumberTooHigh({expected}, {actual}) - caller should use verify_and_handle"
+                );
+                Ok(None)
             }
             MessageVerificationError::IncorrectBeginString(begin_string) => Ok(Some(
-                self.handle_incorrect_begin_string(state, begin_string)
+                self.handle_incorrect_begin_string(writer, begin_string)
                     .await,
             )),
             MessageVerificationError::IncorrectCompId {
@@ -147,12 +190,12 @@ impl<Store: MessageStore> SessionCtx<'_, Store> {
                 comp_id_type,
                 msg_seq_num,
             } => Ok(Some(
-                self.handle_incorrect_comp_id(state, comp_id, comp_id_type, msg_seq_num)
+                self.handle_incorrect_comp_id(writer, comp_id, comp_id_type, msg_seq_num)
                     .await,
             )),
             MessageVerificationError::SendingTimeAccuracyIssue { msg_seq_num } => {
                 self.handle_sending_time_accuracy_problem(
-                    state,
+                    writer,
                     msg_seq_num,
                     "unexpected sending time",
                 )
@@ -161,7 +204,7 @@ impl<Store: MessageStore> SessionCtx<'_, Store> {
             }
             MessageVerificationError::SendingTimeMissing { msg_seq_num } => {
                 self.handle_sending_time_accuracy_problem(
-                    state,
+                    writer,
                     msg_seq_num,
                     "sending time missing",
                 )
@@ -169,7 +212,7 @@ impl<Store: MessageStore> SessionCtx<'_, Store> {
                 Ok(None)
             }
             MessageVerificationError::OriginalSendingTimeMissing { msg_seq_num } => {
-                self.handle_original_sending_time_missing(state, msg_seq_num)
+                self.handle_original_sending_time_missing(writer, msg_seq_num)
                     .await;
                 Ok(None)
             }
@@ -177,7 +220,7 @@ impl<Store: MessageStore> SessionCtx<'_, Store> {
                 msg_seq_num, ..
             } => {
                 self.handle_sending_time_accuracy_problem(
-                    state,
+                    writer,
                     msg_seq_num,
                     "original sending time is after sending time",
                 )
@@ -189,11 +232,11 @@ impl<Store: MessageStore> SessionCtx<'_, Store> {
 
     async fn handle_incorrect_begin_string(
         &mut self,
-        state: &SessionState,
+        writer: &WriterRef,
         received_begin_string: String,
     ) -> SessionState {
         self.logout_and_terminate(
-            state,
+            writer,
             &format!("beginString={received_begin_string} is not supported"),
         )
         .await;
@@ -202,7 +245,7 @@ impl<Store: MessageStore> SessionCtx<'_, Store> {
 
     async fn handle_incorrect_comp_id(
         &mut self,
-        state: &SessionState,
+        writer: &WriterRef,
         received_comp_id: String,
         comp_id_type: CompIdType,
         msg_seq_num: u64,
@@ -213,19 +256,17 @@ impl<Store: MessageStore> SessionCtx<'_, Store> {
         let reject = Reject::new(msg_seq_num)
             .session_reject_reason(SessionRejectReason::ValueIsIncorrect)
             .text(&format!("invalid comp ID {received_comp_id}"));
-        if let Some(writer) = state.get_writer()
-            && let Err(err) = self.send_message(writer, reject).await
-        {
+        if let Err(err) = self.send_message(writer, reject).await {
             error!("failed to send reject message with invalid comp ID: {err}");
         }
-        self.logout_and_terminate(state, "incorrect comp ID received")
+        self.logout_and_terminate(writer, "incorrect comp ID received")
             .await;
         SessionState::new_disconnected(true, "incorrect comp ID")
     }
 
     async fn handle_sequence_number_too_low(
         &mut self,
-        state: &SessionState,
+        writer: &WriterRef,
         expected: u64,
         actual: u64,
         possible_duplicate: bool,
@@ -240,62 +281,20 @@ impl<Store: MessageStore> SessionCtx<'_, Store> {
             "we expected {expected} sequence number, but target sent lower ({actual}), terminating..."
         );
         let reason = format!("sequence number too low (actual {actual}, expected {expected})");
-        self.logout_and_terminate(state, &reason).await;
+        self.logout_and_terminate(writer, &reason).await;
         Some(SessionState::new_disconnected(false, &reason))
-    }
-
-    async fn handle_sequence_number_too_high(
-        &mut self,
-        state: &mut SessionState,
-        expected: u64,
-        actual: u64,
-    ) -> Result<Option<SessionState>, SessionOperationError> {
-        match state.try_transition_to_awaiting_resend(expected, actual) {
-            AwaitingResendTransitionOutcome::Success => {
-                debug!(
-                    "we are behind target (ours: {expected}, theirs: {actual}), requesting resend."
-                );
-                if let Some(writer) = state.get_writer() {
-                    let request = ResendRequest::new(expected, actual);
-                    self.send_message(writer, request)
-                        .await
-                        .with_send_context("resend request")?;
-                }
-                Ok(None) // state already mutated by try_transition_to_awaiting_resend
-            }
-            AwaitingResendTransitionOutcome::InvalidState(reason) => {
-                error!("failed to request resend: {reason}");
-                Ok(None)
-            }
-            AwaitingResendTransitionOutcome::BeginSeqNumberTooLow => {
-                state.disconnect_writer().await;
-                Ok(Some(SessionState::new_disconnected(
-                    false,
-                    "awaiting resend begin seq number unexpectedly lower than the previous resend request's",
-                )))
-            }
-            AwaitingResendTransitionOutcome::AttemptsExceeded => {
-                state.disconnect_writer().await;
-                Ok(Some(SessionState::new_disconnected(
-                    false,
-                    "resend request attempts exceeded, manual intervention required",
-                )))
-            }
-        }
     }
 
     async fn handle_sending_time_accuracy_problem(
         &mut self,
-        state: &SessionState,
+        writer: &WriterRef,
         msg_seq_num: u64,
         text: &str,
     ) {
         let reject = Reject::new(msg_seq_num)
             .session_reject_reason(SessionRejectReason::SendingtimeAccuracyProblem)
             .text(text);
-        if let Some(writer) = state.get_writer()
-            && let Err(err) = self.send_message(writer, reject).await
-        {
+        if let Err(err) = self.send_message(writer, reject).await {
             error!("failed to send reject for time accuracy problem: {err}");
         }
         if let Err(err) = self.store.increment_target_seq_number().await {
@@ -303,17 +302,11 @@ impl<Store: MessageStore> SessionCtx<'_, Store> {
         }
     }
 
-    async fn handle_original_sending_time_missing(
-        &mut self,
-        state: &SessionState,
-        msg_seq_num: u64,
-    ) {
+    async fn handle_original_sending_time_missing(&mut self, writer: &WriterRef, msg_seq_num: u64) {
         let reject = Reject::new(msg_seq_num)
             .session_reject_reason(SessionRejectReason::RequiredTagMissing)
             .text("original sending time is required");
-        if let Some(writer) = state.get_writer()
-            && let Err(err) = self.send_message(writer, reject).await
-        {
+        if let Err(err) = self.send_message(writer, reject).await {
             error!("failed to send reject for time missing tag: {err}");
         }
         if let Err(err) = self.store.increment_target_seq_number().await {
@@ -322,15 +315,13 @@ impl<Store: MessageStore> SessionCtx<'_, Store> {
     }
 
     /// Send a logout message and immediately disconnect.
-    async fn logout_and_terminate(&mut self, state: &SessionState, reason: &str) {
-        if let Some(writer) = state.get_writer() {
-            let logout = Logout::with_reason(reason.to_string());
-            match self.prepare_message(logout).await {
-                Ok(prepared) => writer.send_raw_message(prepared.raw).await,
-                Err(err) => warn!("failed to send logout during session termination: {err}"),
-            }
-            writer.disconnect().await;
+    pub(crate) async fn logout_and_terminate(&mut self, writer: &WriterRef, reason: &str) {
+        let logout = Logout::with_reason(reason.to_string());
+        match self.prepare_message(logout).await {
+            Ok(prepared) => writer.send_raw_message(prepared.raw).await,
+            Err(err) => warn!("failed to send logout during session termination: {err}"),
         }
+        writer.disconnect().await;
     }
 
     pub async fn resend_messages(
@@ -397,6 +388,7 @@ impl<Store: MessageStore> SessionCtx<'_, Store> {
         }
 
         if let Some(begin) = reset_start {
+            // the final reset if needed
             let end = sequence_number;
             Self::log_skipped_admin_messages(begin, end);
             self.send_sequence_reset(writer, begin, end).await?;
@@ -440,7 +432,7 @@ impl<Store: MessageStore> SessionCtx<'_, Store> {
 
     pub async fn handle_invalid_msg_type(
         &mut self,
-        state: &SessionState,
+        writer: &WriterRef,
         message: &Message,
         msg_type: &str,
     ) {
@@ -449,9 +441,7 @@ impl<Store: MessageStore> SessionCtx<'_, Store> {
                 let reject = Reject::new(msg_seq_num)
                     .session_reject_reason(SessionRejectReason::InvalidMsgtype)
                     .text(&format!("invalid message type {msg_type}"));
-                if let Some(writer) = state.get_writer()
-                    && let Err(err) = self.send_message(writer, reject).await
-                {
+                if let Err(err) = self.send_message(writer, reject).await {
                     error!("failed to send reject message for invalid msgtype: {err}");
                 }
 
@@ -594,6 +584,7 @@ impl SessionState {
         }
     }
 
+    #[cfg(test)]
     pub fn try_transition_to_awaiting_resend(
         &mut self,
         begin: u64,
@@ -693,6 +684,7 @@ impl SessionState {
         self.get_writer().is_some()
     }
 
+    #[cfg(test)]
     pub fn is_logged_on(&self) -> bool {
         matches!(self, SessionState::Active(_))
             || matches!(self, SessionState::AwaitingResend { .. })
