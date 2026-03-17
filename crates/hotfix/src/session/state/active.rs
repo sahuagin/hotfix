@@ -1,7 +1,10 @@
-use crate::session::state::TestRequestId;
+use crate::message::heartbeat::Heartbeat;
+use crate::session::state::{SessionCtx, TestRequestId};
 use crate::transport::writer::WriterRef;
+use hotfix_store::MessageStore;
 use std::time::Duration;
 use tokio::time::Instant;
+use tracing::error;
 
 pub(crate) struct ActiveState {
     /// The writer's reference to send messages to the counterparty
@@ -39,6 +42,21 @@ impl ActiveState {
 
     pub(crate) fn expected_test_response_id(&self) -> Option<&TestRequestId> {
         self.sent_test_request_id.as_ref()
+    }
+
+    pub(crate) async fn on_heartbeat_timeout<Store: MessageStore>(
+        &mut self,
+        ctx: &mut SessionCtx<'_, Store>,
+    ) {
+        let prepared = match ctx.prepare_message(Heartbeat::default()).await {
+            Ok(prepared) => prepared,
+            Err(err) => {
+                error!(err = ?err, "failed to send heartbeat message");
+                return;
+            }
+        };
+        self.writer.send_raw_message(prepared.raw).await;
+        self.reset_heartbeat_timer(ctx.config.heartbeat_interval);
     }
 }
 

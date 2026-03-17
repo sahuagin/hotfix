@@ -10,16 +10,71 @@ pub(crate) use awaiting_logout::AwaitingLogoutState;
 pub(crate) use awaiting_resend::{AwaitingResendState, AwaitingResendTransitionOutcome};
 pub(crate) use disconnected::DisconnectedState;
 
+use crate::config::SessionConfig;
 use crate::message::logon::Logon;
 use crate::message::logout::Logout;
 use crate::message::parser::RawFixMessage;
+use crate::message::{OutboundMessage, generate_message};
+use crate::session::error::InternalSendError;
 use crate::session::event::AwaitingActiveSessionResponse;
 use crate::session::info::Status as SessionInfoStatus;
+use crate::store::StoreError;
 use crate::transport::writer::WriterRef;
+use hotfix_store::MessageStore;
 use std::time::Duration;
 use tokio::sync::oneshot;
 use tokio::time::Instant;
 use tracing::{debug, error};
+
+pub(crate) struct SessionCtx<'a, Store> {
+    pub config: &'a SessionConfig,
+    pub store: &'a mut Store,
+}
+
+#[allow(dead_code)] // fields used in later sub-phases
+pub(crate) struct PreparedMessage {
+    pub seq_num: u64,
+    pub msg_type: String,
+    pub raw: RawFixMessage,
+}
+
+impl<Store: MessageStore> SessionCtx<'_, Store> {
+    pub async fn prepare_message(
+        &mut self,
+        message: impl OutboundMessage,
+    ) -> Result<PreparedMessage, InternalSendError> {
+        let seq_num = self.store.next_sender_seq_number();
+        let msg_type = message.message_type().to_string();
+        let msg = generate_message(
+            &self.config.begin_string,
+            &self.config.sender_comp_id,
+            &self.config.target_comp_id,
+            seq_num,
+            message,
+        )
+        .map_err(|e| {
+            InternalSendError::Persist(StoreError::PersistMessage {
+                sequence_number: seq_num,
+                source: e.into(),
+            })
+        })?;
+
+        self.store
+            .increment_sender_seq_number()
+            .await
+            .map_err(InternalSendError::SequenceNumber)?;
+        self.store
+            .add(seq_num, &msg)
+            .await
+            .map_err(InternalSendError::Persist)?;
+
+        Ok(PreparedMessage {
+            seq_num,
+            msg_type,
+            raw: RawFixMessage::new(msg),
+        })
+    }
+}
 
 const TEST_REQUEST_THRESHOLD: f64 = 1.2;
 

@@ -46,7 +46,8 @@ pub use crate::session::session_ref::InternalSessionRef;
 use crate::session::session_ref::OutboundRequest;
 use crate::session::state::SessionState;
 use crate::session::state::{
-    AwaitingLogonState, AwaitingLogoutState, AwaitingResendTransitionOutcome, TestRequestId,
+    AwaitingLogonState, AwaitingLogoutState, AwaitingResendTransitionOutcome, SessionCtx,
+    TestRequestId,
 };
 use crate::session_schedule::{SessionPeriodComparison, SessionSchedule};
 use crate::store::MessageStore;
@@ -1088,8 +1089,15 @@ where
     }
 
     async fn handle_heartbeat_timeout(&mut self) {
-        if let Err(err) = self.send_message(Heartbeat::default()).await {
-            error!(err = ?err, "failed to send heartbeat message");
+        let Session {
+            ref mut state,
+            ref mut store,
+            ref config,
+            ..
+        } = *self;
+        if let SessionState::Active(active) = state {
+            let mut ctx = SessionCtx { config, store };
+            active.on_heartbeat_timeout(&mut ctx).await;
         }
     }
 
