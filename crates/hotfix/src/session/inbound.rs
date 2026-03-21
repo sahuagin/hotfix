@@ -1,7 +1,7 @@
 use crate::message::logout::Logout;
 use crate::message::reject::Reject;
 use crate::message::verification::verify_message;
-use crate::message::verification_error::{CompIdType, MessageVerificationError};
+use crate::message::verification_issue::{CompIdType, MessageError, VerificationIssue};
 use crate::session::ctx::{SessionCtx, TransitionResult};
 use crate::session::outbound;
 use crate::session::state::SessionState;
@@ -13,12 +13,12 @@ use hotfix_store::MessageStore;
 use tracing::error;
 use tracing::warn;
 
-pub(crate) fn verify_message_with_ctx<A, S: MessageStore>(
+fn verify_message_with_ctx<A, S: MessageStore>(
     ctx: &SessionCtx<A, S>,
     message: &Message,
     check_too_high: bool,
     check_too_low: bool,
-) -> Result<(), MessageVerificationError> {
+) -> Result<(), VerificationIssue> {
     let expected_seq_number = if check_too_high || check_too_low {
         Some(ctx.store.next_target_seq_number())
     } else {
@@ -33,7 +33,46 @@ pub(crate) fn verify_message_with_ctx<A, S: MessageStore>(
     )
 }
 
-pub(crate) async fn handle_sending_time_accuracy_problem<A, S: MessageStore>(
+/// The result of verifying an inbound message after handling message errors.
+///
+/// This is the return type of [`verify_and_handle_errors`] which handles the
+/// common verification pattern: verify the message, handle any [`MessageError`]
+/// internally, and only surface sequence gaps back to the caller for
+/// state-specific handling.
+pub(crate) enum VerificationOutcome {
+    /// The message passed verification.
+    Ok,
+    /// The counterparty is ahead — the caller must handle this per-state.
+    SequenceGap { expected: u64, actual: u64 },
+    /// A message error was handled (reject/logout sent). The caller should
+    /// apply the returned transition.
+    Handled(TransitionResult),
+}
+
+/// Verifies an inbound message and handles any [`MessageError`] by sending
+/// the appropriate reject/logout. Only [`VerificationIssue::SequenceGap`] is
+/// surfaced back as [`VerificationOutcome::SequenceGap`] for the caller to
+/// handle per-state.
+pub(crate) async fn verify_and_handle_errors<A, S: MessageStore>(
+    ctx: &mut SessionCtx<A, S>,
+    writer: &WriterRef,
+    message: &Message,
+    check_too_high: bool,
+    check_too_low: bool,
+) -> VerificationOutcome {
+    match verify_message_with_ctx(ctx, message, check_too_high, check_too_low) {
+        Result::Ok(()) => VerificationOutcome::Ok,
+        Err(VerificationIssue::SequenceGap { expected, actual }) => {
+            VerificationOutcome::SequenceGap { expected, actual }
+        }
+        Err(VerificationIssue::InvalidMessage(err)) => {
+            let result = handle_verification_error(ctx, writer, err).await;
+            VerificationOutcome::Handled(result)
+        }
+    }
+}
+
+async fn handle_sending_time_accuracy_problem<A, S: MessageStore>(
     ctx: &mut SessionCtx<A, S>,
     writer: &WriterRef,
     msg_seq_num: u64,
@@ -50,7 +89,7 @@ pub(crate) async fn handle_sending_time_accuracy_problem<A, S: MessageStore>(
     }
 }
 
-pub(crate) async fn handle_incorrect_begin_string<A, S: MessageStore>(
+async fn handle_incorrect_begin_string<A, S: MessageStore>(
     ctx: &mut SessionCtx<A, S>,
     writer: &WriterRef,
     received_begin_string: String,
@@ -69,7 +108,7 @@ pub(crate) async fn handle_incorrect_begin_string<A, S: MessageStore>(
     ))
 }
 
-pub(crate) async fn handle_incorrect_comp_id<A, S: MessageStore>(
+async fn handle_incorrect_comp_id<A, S: MessageStore>(
     ctx: &mut SessionCtx<A, S>,
     writer: &WriterRef,
     received_comp_id: String,
@@ -92,7 +131,7 @@ pub(crate) async fn handle_incorrect_comp_id<A, S: MessageStore>(
     TransitionResult::TransitionTo(SessionState::new_disconnected(true, "incorrect comp ID"))
 }
 
-pub(crate) async fn handle_sequence_number_too_low<A, S: MessageStore>(
+async fn handle_sequence_number_too_low<A, S: MessageStore>(
     ctx: &mut SessionCtx<A, S>,
     writer: &WriterRef,
     expected: u64,
@@ -148,7 +187,7 @@ pub(crate) async fn handle_invalid_msg_type<A, S: MessageStore>(
     }
 }
 
-pub(crate) async fn handle_original_sending_time_missing<A, S: MessageStore>(
+async fn handle_original_sending_time_missing<A, S: MessageStore>(
     ctx: &mut SessionCtx<A, S>,
     writer: &WriterRef,
     msg_seq_num: u64,
@@ -161,6 +200,59 @@ pub(crate) async fn handle_original_sending_time_missing<A, S: MessageStore>(
     }
     if let Err(err) = ctx.store.increment_target_seq_number().await {
         error!("failed to increment target seq number: {:?}", err);
+    }
+}
+
+async fn handle_verification_error<A, S: MessageStore>(
+    ctx: &mut SessionCtx<A, S>,
+    writer: &WriterRef,
+    error: MessageError,
+) -> TransitionResult {
+    match error {
+        MessageError::SeqNumberTooLow {
+            expected,
+            actual,
+            possible_duplicate,
+        } => {
+            handle_sequence_number_too_low(ctx, writer, expected, actual, possible_duplicate).await
+        }
+        MessageError::IncorrectBeginString(begin_string) => {
+            handle_incorrect_begin_string(ctx, writer, begin_string).await
+        }
+        MessageError::IncorrectCompId {
+            comp_id,
+            comp_id_type,
+            msg_seq_num,
+        } => handle_incorrect_comp_id(ctx, writer, comp_id, comp_id_type, msg_seq_num).await,
+        MessageError::SendingTimeAccuracyIssue { msg_seq_num } => {
+            handle_sending_time_accuracy_problem(
+                ctx,
+                writer,
+                msg_seq_num,
+                "unexpected sending time",
+            )
+            .await;
+            TransitionResult::Stay
+        }
+        MessageError::SendingTimeMissing { msg_seq_num } => {
+            handle_sending_time_accuracy_problem(ctx, writer, msg_seq_num, "sending time missing")
+                .await;
+            TransitionResult::Stay
+        }
+        MessageError::OriginalSendingTimeMissing { msg_seq_num } => {
+            handle_original_sending_time_missing(ctx, writer, msg_seq_num).await;
+            TransitionResult::Stay
+        }
+        MessageError::OriginalSendingTimeAfterSendingTime { msg_seq_num, .. } => {
+            handle_sending_time_accuracy_problem(
+                ctx,
+                writer,
+                msg_seq_num,
+                "original sending time is after sending time",
+            )
+            .await;
+            TransitionResult::Stay
+        }
     }
 }
 
