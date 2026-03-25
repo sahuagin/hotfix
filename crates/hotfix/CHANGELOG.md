@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.0](https://github.com/Validus-Risk-Management/hotfix/compare/hotfix-v0.10.0...hotfix-v0.11.0) - 2026-03-25
+
+### Added
+
+- notify application of state changes ([#326](https://github.com/Validus-Risk-Management/hotfix/pull/326))
+
+### Other
+
+- centralise message verification and extract shared inbound handlers ([#325](https://github.com/Validus-Risk-Management/hotfix/pull/325))
+- break message verification handling out into free function ([#324](https://github.com/Validus-Risk-Management/hotfix/pull/324))
+- start breaking out issue handling into their own inbound module ([#323](https://github.com/Validus-Risk-Management/hotfix/pull/323))
+- convert resend logic to free functions outside the session code ([#322](https://github.com/Validus-Risk-Management/hotfix/pull/322))
+- introduce SessionCtx to hold non-state-machine state ([#321](https://github.com/Validus-Risk-Management/hotfix/pull/321))
+- break out session state variants into their own modules ([#319](https://github.com/Validus-Risk-Management/hotfix/pull/319))
+
 ## [0.10.0](https://github.com/Validus-Risk-Management/hotfix/compare/hotfix-v0.9.1...hotfix-v0.10.0) - 2026-02-24
 
 ### Fixed
