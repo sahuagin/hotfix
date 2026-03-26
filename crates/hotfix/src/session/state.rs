@@ -15,7 +15,7 @@ use crate::message::OutboundMessage;
 use crate::message::logon::Logon;
 use crate::message::logout::Logout;
 use crate::message::verification::VerificationFlags;
-use crate::session::ctx::{SessionCtx, TransitionResult, VerificationResult};
+use crate::session::ctx::{PreProcessDecision, SessionCtx, TransitionResult, VerificationResult};
 use crate::session::error::{InternalSendError, InternalSendResultExt, SessionOperationError};
 use crate::session::event::ScheduleResponse;
 use crate::session::info::Status as SessionInfoStatus;
@@ -61,6 +61,66 @@ impl SessionState {
             peer_deadline: Instant::now() + Duration::from_secs(peer_interval),
             sent_test_request_id: None,
         })
+    }
+
+    /// Handles a Logon message from the peer. Only AwaitingLogon produces a
+    /// transition — all other states log an error and stay.
+    pub(crate) async fn on_peer_logon<A: Application, S: MessageStore>(
+        &self,
+        ctx: &mut SessionCtx<A, S>,
+    ) -> Result<TransitionResult, SessionOperationError> {
+        match self {
+            Self::AwaitingLogon(state) => state.on_peer_logon(ctx).await,
+            _ => {
+                error!("received unexpected logon message");
+                Ok(TransitionResult::Stay)
+            }
+        }
+    }
+
+    /// Returns the transition to apply when a Logout message is received from the peer.
+    /// Each state determines its own reconnect policy and disconnect reason.
+    pub(crate) fn on_peer_logout(&self) -> TransitionResult {
+        match self {
+            Self::AwaitingLogout(AwaitingLogoutState { reconnect, .. }) => {
+                TransitionResult::TransitionTo(Self::new_disconnected(
+                    *reconnect,
+                    "logout completed",
+                ))
+            }
+            Self::Disconnected(_) => TransitionResult::Stay,
+            _ => TransitionResult::TransitionTo(Self::new_disconnected(
+                true,
+                "peer has logged us out",
+            )),
+        }
+    }
+
+    /// Returns the transition to apply when the transport layer reports a disconnect.
+    /// Each state determines its own reconnect policy.
+    pub(crate) fn on_disconnect(&self, reason: &str) -> TransitionResult {
+        match self {
+            Self::Active(_) | Self::AwaitingLogon(_) | Self::AwaitingResend(_) => {
+                TransitionResult::TransitionTo(Self::new_disconnected(true, reason))
+            }
+            Self::AwaitingLogout(AwaitingLogoutState { reconnect, .. }) => {
+                TransitionResult::TransitionTo(Self::new_disconnected(*reconnect, reason))
+            }
+            Self::Disconnected(_) => {
+                warn!("disconnect message was received, but the session is already disconnected");
+                TransitionResult::Stay
+            }
+        }
+    }
+
+    /// Let the current state decide whether an inbound message should be processed,
+    /// queued for later, or rejected before verification and dispatch.
+    pub(crate) fn pre_process_inbound(&mut self, message: Message) -> PreProcessDecision {
+        match self {
+            Self::AwaitingResend(state) => state.pre_process_inbound(message),
+            Self::AwaitingLogon(state) => state.pre_process_inbound(message),
+            _ => PreProcessDecision::Accept(message),
+        }
     }
 
     pub fn should_reconnect(&self) -> bool {

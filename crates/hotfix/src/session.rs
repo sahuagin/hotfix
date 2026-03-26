@@ -36,7 +36,7 @@ use crate::message::sequence_reset::SequenceReset;
 use crate::message::test_request::TestRequest;
 use crate::message::verification::VerificationFlags;
 use crate::session::admin_request::AdminRequest;
-use crate::session::ctx::{SessionCtx, TransitionResult, VerificationResult};
+use crate::session::ctx::{PreProcessDecision, SessionCtx, TransitionResult, VerificationResult};
 use crate::session::error::SessionCreationError;
 use crate::session::error::{InternalSendError, InternalSendResultExt, SessionOperationError};
 pub use crate::session::error::{SendError, SendOutcome};
@@ -48,7 +48,7 @@ pub(crate) use crate::session::session_ref::InternalSessionRef;
 pub use crate::session::session_ref::InternalSessionRef;
 use crate::session::session_ref::OutboundRequest;
 use crate::session::state::SessionState;
-use crate::session::state::{AwaitingLogonState, AwaitingLogoutState, TestRequestId};
+use crate::session::state::{AwaitingLogonState, TestRequestId};
 use crate::session_schedule::{SessionPeriodComparison, SessionSchedule};
 use crate::store::MessageStore;
 use crate::transport::writer::WriterRef;
@@ -194,28 +194,19 @@ where
     }
 
     async fn process_message(&mut self, message: Message) -> Result<(), SessionOperationError> {
+        let message = match self.state.pre_process_inbound(message) {
+            PreProcessDecision::Accept(msg) => msg,
+            PreProcessDecision::Queued => return Ok(()),
+            PreProcessDecision::Disconnect => {
+                self.state.disconnect_writer().await;
+                return Ok(());
+            }
+        };
+
         let message_type: &str = message
             .header()
             .get(MSG_TYPE)
             .map_err(|_| SessionOperationError::MissingField("MSG_TYPE"))?;
-
-        if let SessionState::AwaitingResend(state) = &mut self.state {
-            let seq_number = get_msg_seq_num(&message);
-            if seq_number > state.end_seq_number && message_type != ResendRequest::MSG_TYPE {
-                state.inbound_queue.push_back(message);
-                return Ok(());
-            }
-        }
-
-        // TODO: add state-level pre-process check that validates whether the message type
-        // is acceptable in the current state (e.g. AwaitingLogon rejects non-Logon,
-        // unexpected Logon in Active should be rejected per FIX spec).
-        if let SessionState::AwaitingLogon(_) = &mut self.state
-            && message_type != Logon::MSG_TYPE
-        {
-            self.state.disconnect_writer().await;
-            return Ok(());
-        }
 
         let flags = VerificationFlags::for_message(&message)?;
         if let VerificationResult::Issue(result) = self
@@ -286,46 +277,42 @@ where
     }
 
     async fn check_end_of_resend(&mut self) -> Result<(), SessionOperationError> {
-        let backlog = if let SessionState::AwaitingResend(state) = &mut self.state {
-            if self.ctx.store.next_target_seq_number() > state.end_seq_number {
-                let inbound_queue = std::mem::take(&mut state.inbound_queue);
-                let new_state = SessionState::new_active(
-                    state.writer.clone(),
-                    self.ctx.config.heartbeat_interval,
-                );
-                self.apply_transition(TransitionResult::TransitionTo(new_state))
-                    .await;
-                Some(inbound_queue)
-            } else {
-                None
-            }
+        let completed = if let SessionState::AwaitingResend(state) = &mut self.state {
+            state.try_complete(
+                self.ctx.store.next_target_seq_number(),
+                self.ctx.config.heartbeat_interval,
+            )
         } else {
             None
         };
 
-        if let Some(mut inbound_queue) = backlog {
-            // we have reached the end of the resend,
-            // process queued messages and resume normal operation
-            debug!("resend is done, processing backlog");
-            while let Some(msg) = inbound_queue.pop_front() {
-                let seq_number: u64 = msg.get(MSG_SEQ_NUM).unwrap_or_else(|e| {
-                    error!("failed to get seq number: {:?}", e);
-                    0
-                });
-                let msg_type: &str = msg.header().get(MSG_TYPE).unwrap_or("");
-                debug!(seq_number, msg_type, "processing queued message");
+        let Some((new_state, mut backlog)) = completed else {
+            return Ok(());
+        };
 
-                if msg_type == ResendRequest::MSG_TYPE {
-                    // ResendRequest was already processed when it arrived (it bypasses
-                    // the queue in process_message). Just increment the target seq number
-                    // for sequence accounting purposes.
-                    self.ctx.store.increment_target_seq_number().await?;
-                } else {
-                    self.process_message(msg).await?;
-                }
+        self.apply_transition(TransitionResult::TransitionTo(new_state))
+            .await;
+
+        // Process queued messages and resume normal operation
+        debug!("resend is done, processing backlog");
+        while let Some(msg) = backlog.pop_front() {
+            let seq_number: u64 = msg.get(MSG_SEQ_NUM).unwrap_or_else(|e| {
+                error!("failed to get seq number: {:?}", e);
+                0
+            });
+            let msg_type: &str = msg.header().get(MSG_TYPE).unwrap_or("");
+            debug!(seq_number, msg_type, "processing queued message");
+
+            if msg_type == ResendRequest::MSG_TYPE {
+                // ResendRequest was already processed when it arrived (it bypasses
+                // the queue in process_message). Just increment the target seq number
+                // for sequence accounting purposes.
+                self.ctx.store.increment_target_seq_number().await?;
+            } else {
+                self.process_message(msg).await?;
             }
-            debug!("resend backlog is cleared, resuming normal operation");
         }
+        debug!("resend backlog is cleared, resuming normal operation");
 
         Ok(())
     }
@@ -346,39 +333,14 @@ where
     }
 
     async fn on_disconnect(&mut self, reason: String) {
-        let transition = match self.state {
-            SessionState::Active(_)
-            | SessionState::AwaitingLogon(_)
-            | SessionState::AwaitingResend(_) => {
-                self.state.disconnect_writer().await;
-                TransitionResult::TransitionTo(SessionState::new_disconnected(true, &reason))
-            }
-            SessionState::Disconnected(_) => {
-                warn!("disconnect message was received, but the session is already disconnected");
-                TransitionResult::Stay
-            }
-            SessionState::AwaitingLogout(AwaitingLogoutState { reconnect, .. }) => {
-                TransitionResult::TransitionTo(SessionState::new_disconnected(reconnect, &reason))
-            }
-        };
+        self.state.disconnect_writer().await;
+        let transition = self.state.on_disconnect(&reason);
         self.apply_transition(transition).await;
     }
 
     async fn on_logon(&mut self) -> Result<(), SessionOperationError> {
-        if let SessionState::AwaitingLogon(AwaitingLogonState { writer, .. }) = &self.state {
-            let writer = writer.clone();
-            // happy logon flow, the session is now active
-            self.apply_transition(TransitionResult::TransitionTo(SessionState::new_active(
-                writer,
-                self.ctx.config.heartbeat_interval,
-            )))
-            .await;
-            self.ctx.application.on_logon().await;
-            self.ctx.store.increment_target_seq_number().await?;
-        } else {
-            error!("received unexpected logon message");
-        }
-
+        let transition = self.state.on_peer_logon(&mut self.ctx).await?;
+        self.apply_transition(transition).await;
         Ok(())
     }
 
@@ -394,26 +356,9 @@ where
             .on_logout("peer has logged us out")
             .await;
 
-        match self.state {
-            // if the session is already disconnected, we have nothing else to do
-            SessionState::Disconnected(..) => {}
-            // if we initiated the logout, preserve the reconnect flag
-            SessionState::AwaitingLogout(AwaitingLogoutState { reconnect, .. }) => {
-                self.state.disconnect_writer().await;
-                self.apply_transition(TransitionResult::TransitionTo(
-                    SessionState::new_disconnected(reconnect, "logout completed"),
-                ))
-                .await;
-            }
-            // otherwise assume it makes sense to try to reconnect
-            _ => {
-                self.state.disconnect_writer().await;
-                self.apply_transition(TransitionResult::TransitionTo(
-                    SessionState::new_disconnected(true, "peer has logged us out"),
-                ))
-                .await;
-            }
-        }
+        self.state.disconnect_writer().await;
+        let transition = self.state.on_peer_logout();
+        self.apply_transition(transition).await;
 
         self.ctx.store.increment_target_seq_number().await?;
         Ok(())
