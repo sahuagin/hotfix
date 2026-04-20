@@ -52,6 +52,7 @@ jobs:
         with:
           fail_ci_if_error: true
           token: ${{ secrets.CODECOV_TOKEN }}
+          dry_run: ${{ vars.CODECOV_DRY_RUN == 'true'}}
           flags: core
           files: lcov.info
 
@@ -71,5 +72,6 @@ jobs:
         with:
           fail_ci_if_error: true
           token: ${{ secrets.CODECOV_TOKEN }}
+          dry_run: ${{ vars.CODECOV_DRY_RUN == 'true'}}
           flags: mongodb
           files: lcov.info

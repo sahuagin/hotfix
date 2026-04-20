@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+ - skip check for original sending time(tag 122) in sequence reset messages ([#322](https://github.com/Validus-Risk-Management/hotfix/pull/334))
+
 ## [0.11.0](https://github.com/Validus-Risk-Management/hotfix/compare/hotfix-v0.10.0...hotfix-v0.11.0) - 2026-03-25
 
 ### Added
