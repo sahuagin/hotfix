@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.19](https://github.com/Validus-Risk-Management/hotfix/compare/hotfix-web-ui-v0.1.18...hotfix-web-ui-v0.1.19) - 2026-04-23
+
+### Other
+
+- updated the following local packages: hotfix
+
 ## [0.1.18](https://github.com/Validus-Risk-Management/hotfix/compare/hotfix-web-ui-v0.1.17...hotfix-web-ui-v0.1.18) - 2026-04-20
 
 ### Other

@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.2](https://github.com/Validus-Risk-Management/hotfix/compare/hotfix-v0.11.1...hotfix-v0.11.2) - 2026-04-23
+
+### Added
+
+- admin operation to set the next expected target sequence number ([#342](https://github.com/Validus-Risk-Management/hotfix/pull/342))
+
 ## [0.11.1](https://github.com/Validus-Risk-Management/hotfix/compare/hotfix-v0.11.0...hotfix-v0.11.1) - 2026-04-20
 
 ### Added
