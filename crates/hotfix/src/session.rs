@@ -9,7 +9,7 @@ mod session_handle;
 pub mod session_ref;
 mod state;
 #[cfg(test)]
-mod test_utils;
+pub(crate) mod test_utils;
 
 use chrono::Utc;
 use hotfix_message::dict::Dictionary;

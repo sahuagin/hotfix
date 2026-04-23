@@ -84,42 +84,9 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::message::Message;
-    use crate::session::admin_request::AdminRequest;
     use crate::session::event::SessionEvent;
-    use crate::session::session_ref::OutboundRequest;
+    use crate::session::test_utils::create_test_session_ref;
     use tokio::io::{AsyncWriteExt, duplex};
-    use tokio::sync::mpsc;
-
-    #[derive(Clone, Debug, PartialEq)]
-    struct TestMessage;
-
-    impl OutboundMessage for TestMessage {
-        fn write(&self, _msg: &mut Message) {}
-
-        fn message_type(&self) -> &str {
-            "TEST"
-        }
-    }
-
-    /// Creates a test InternalSessionRef that captures events for verification
-    fn create_test_session_ref() -> (
-        InternalSessionRef<TestMessage>,
-        mpsc::Receiver<SessionEvent>,
-    ) {
-        let (event_sender, event_receiver) = mpsc::channel::<SessionEvent>(100);
-        let (outbound_message_sender, _outbound_receiver) =
-            mpsc::channel::<OutboundRequest<TestMessage>>(10);
-        let (admin_request_sender, _admin_receiver) = mpsc::channel::<AdminRequest>(10);
-
-        let session_ref = InternalSessionRef {
-            event_sender,
-            outbound_message_sender,
-            admin_request_sender,
-        };
-
-        (session_ref, event_receiver)
-    }
 
     /// Test that the reader correctly parses a valid FIX message and sends it to the session
     /// for processing.

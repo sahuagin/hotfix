@@ -82,16 +82,13 @@ impl<Outbound: OutboundMessage> InternalSessionRef<Outbound> {
         Ok(receiver.await?)
     }
 
-    pub async fn await_in_schedule(&self) -> Result<(), SessionGone> {
+    pub async fn await_in_schedule(&self) -> Result<ScheduleResponse, SessionGone> {
         debug!("awaiting in-schedule time");
         let (sender, receiver) = oneshot::channel::<ScheduleResponse>();
         self.event_sender
             .send(SessionEvent::AwaitSchedule(sender))
             .await?;
-        receiver.await?;
-
-        debug!("resuming connection as schedule is active");
-        Ok(())
+        Ok(receiver.await?)
     }
 }
 
@@ -108,5 +105,54 @@ impl From<mpsc::error::SendError<SessionEvent>> for SessionGone {
 impl From<oneshot::error::RecvError> for SessionGone {
     fn from(err: oneshot::error::RecvError) -> Self {
         Self(err.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::session::test_utils::create_test_session_ref;
+
+    #[tokio::test]
+    async fn await_in_schedule_returns_in_schedule_when_session_responds_in_schedule() {
+        let (session_ref, mut event_receiver) = create_test_session_ref();
+
+        tokio::spawn(async move {
+            match event_receiver.recv().await {
+                Some(SessionEvent::AwaitSchedule(responder)) => {
+                    let _ = responder.send(ScheduleResponse::InSchedule);
+                }
+                other => panic!("unexpected event: {other:?}"),
+            }
+        });
+
+        let result = session_ref.await_in_schedule().await;
+        assert!(matches!(result, Ok(ScheduleResponse::InSchedule)));
+    }
+
+    #[tokio::test]
+    async fn await_in_schedule_returns_shutdown_when_session_responds_shutdown() {
+        let (session_ref, mut event_receiver) = create_test_session_ref();
+
+        tokio::spawn(async move {
+            match event_receiver.recv().await {
+                Some(SessionEvent::AwaitSchedule(responder)) => {
+                    let _ = responder.send(ScheduleResponse::Shutdown);
+                }
+                other => panic!("unexpected event: {other:?}"),
+            }
+        });
+
+        let result = session_ref.await_in_schedule().await;
+        assert!(matches!(result, Ok(ScheduleResponse::Shutdown)));
+    }
+
+    #[tokio::test]
+    async fn await_in_schedule_returns_err_when_event_channel_closed() {
+        let (session_ref, event_receiver) = create_test_session_ref();
+        drop(event_receiver);
+
+        let result = session_ref.await_in_schedule().await;
+        assert!(matches!(result, Err(SessionGone(_))));
     }
 }

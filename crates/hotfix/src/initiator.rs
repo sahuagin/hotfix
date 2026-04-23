@@ -15,6 +15,7 @@ use crate::application::Application;
 use crate::config::SessionConfig;
 use crate::message::OutboundMessage;
 use crate::session::error::{SendError, SendOutcome, SessionCreationError};
+use crate::session::event::ScheduleResponse;
 use crate::session::{InternalSessionRef, SessionHandle};
 use crate::store::MessageStore;
 use crate::transport::connect;
@@ -107,9 +108,18 @@ async fn establish_connection<Outbound: OutboundMessage>(
     completion_tx: watch::Sender<bool>,
 ) {
     loop {
-        if session_ref.await_in_schedule().await.is_err() {
-            warn!("session task terminated when checking schedule");
-            break;
+        match session_ref.await_in_schedule().await {
+            Ok(ScheduleResponse::InSchedule) => {
+                debug!("resuming connection as schedule is active");
+            }
+            Ok(ScheduleResponse::Shutdown) => {
+                warn!("session indicated shutdown during schedule check");
+                break;
+            }
+            Err(_) => {
+                warn!("session task terminated when checking schedule");
+                break;
+            }
         }
 
         match connect(&config, session_ref.clone()).await {

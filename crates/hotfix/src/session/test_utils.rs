@@ -1,5 +1,9 @@
 use crate::config::SessionConfig;
+use crate::message::{Message, OutboundMessage};
+use crate::session::admin_request::AdminRequest;
 use crate::session::ctx::SessionCtx;
+use crate::session::event::SessionEvent;
+use crate::session::session_ref::{InternalSessionRef, OutboundRequest};
 use crate::store::{MessageStore, Result as StoreResult};
 use crate::transport::writer::{WriterMessage, WriterRef};
 use chrono::{DateTime, Utc};
@@ -116,4 +120,32 @@ pub(crate) fn extract_field(raw: &[u8], tag: u32) -> Option<String> {
         }
     }
     None
+}
+
+#[derive(Clone)]
+pub(crate) struct TestMessage;
+
+impl OutboundMessage for TestMessage {
+    fn write(&self, _msg: &mut Message) {}
+    fn message_type(&self) -> &str {
+        "TEST"
+    }
+}
+
+pub(crate) fn create_test_session_ref() -> (
+    InternalSessionRef<TestMessage>,
+    mpsc::Receiver<SessionEvent>,
+) {
+    let (event_sender, event_receiver) = mpsc::channel::<SessionEvent>(100);
+    let (outbound_message_sender, _outbound_receiver) =
+        mpsc::channel::<OutboundRequest<TestMessage>>(10);
+    let (admin_request_sender, _admin_receiver) = mpsc::channel::<AdminRequest>(10);
+
+    let session_ref = InternalSessionRef {
+        event_sender,
+        outbound_message_sender,
+        admin_request_sender,
+    };
+
+    (session_ref, event_receiver)
 }
