@@ -6,12 +6,16 @@ use tracing::warn;
 pub struct ReaderMessage;
 
 pub struct ReaderRef {
-    disconnect_signal: oneshot::Receiver<()>,
+    pub(crate) disconnect_signal: oneshot::Receiver<()>,
+    pub(crate) kill: oneshot::Sender<()>,
 }
 
 impl ReaderRef {
-    pub fn new(disconnect_signal: oneshot::Receiver<()>) -> Self {
-        Self { disconnect_signal }
+    pub fn new(disconnect_signal: oneshot::Receiver<()>, kill: oneshot::Sender<()>) -> Self {
+        Self {
+            disconnect_signal,
+            kill,
+        }
     }
 
     pub async fn wait_for_disconnect(self) {
