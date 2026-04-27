@@ -10,6 +10,7 @@ use crate::session::error::{SendError, SendOutcome, SessionCreationError};
 use crate::session::event::{ScheduleResponse, SessionEvent};
 use crate::store::MessageStore;
 use crate::transport::writer::WriterRef;
+use crate::wire_observer::WireObserverHandle;
 use crate::{Application, session};
 
 /// A request to send an outbound message, optionally with confirmation.
@@ -23,6 +24,7 @@ pub struct InternalSessionRef<Outbound> {
     pub(crate) event_sender: mpsc::Sender<SessionEvent>,
     pub(crate) outbound_message_sender: mpsc::Sender<OutboundRequest<Outbound>>,
     pub(crate) admin_request_sender: mpsc::Sender<AdminRequest>,
+    pub(crate) wire_observer: WireObserverHandle,
 }
 
 impl<Outbound: OutboundMessage> InternalSessionRef<Outbound> {
@@ -31,11 +33,23 @@ impl<Outbound: OutboundMessage> InternalSessionRef<Outbound> {
         application: impl Application<Outbound = Outbound>,
         store: impl MessageStore + 'static,
     ) -> Result<Self, SessionCreationError> {
+        Self::new_with_observer(config, application, store, None)
+    }
+
+    /// Variant of [`InternalSessionRef::new`] that installs a
+    /// [`crate::WireObserver`] for raw-byte access to every inbound and
+    /// outbound message (including admin/session messages).
+    pub fn new_with_observer(
+        config: SessionConfig,
+        application: impl Application<Outbound = Outbound>,
+        store: impl MessageStore + 'static,
+        wire_observer: WireObserverHandle,
+    ) -> Result<Self, SessionCreationError> {
         let (event_sender, event_receiver) = mpsc::channel::<SessionEvent>(100);
         let (outbound_message_sender, outbound_message_receiver) =
             mpsc::channel::<OutboundRequest<Outbound>>(10);
         let (admin_request_sender, admin_request_receiver) = mpsc::channel::<AdminRequest>(10);
-        let session = Session::new(config, application, store)?;
+        let session = Session::new(config, application, store, wire_observer.clone())?;
         tokio::spawn(session::run_session(
             session,
             event_receiver,
@@ -47,6 +61,7 @@ impl<Outbound: OutboundMessage> InternalSessionRef<Outbound> {
             event_sender,
             outbound_message_sender,
             admin_request_sender,
+            wire_observer,
         })
     }
 

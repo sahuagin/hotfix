@@ -52,6 +52,7 @@ use crate::session::state::{AwaitingLogonState, TestRequestId};
 use crate::session_schedule::{SessionPeriodComparison, SessionSchedule};
 use crate::store::MessageStore;
 use crate::transport::writer::WriterRef;
+use crate::wire_observer::WireObserverHandle;
 use event::SessionEvent;
 use hotfix_message::parsed_message::{InvalidReason, ParsedMessage};
 use hotfix_message::session_fields::{MSG_SEQ_NUM, MSG_TYPE, SessionRejectReason, TEST_REQ_ID};
@@ -64,6 +65,7 @@ struct Session<A, S> {
     state: SessionState,
     schedule_check_timer: Pin<Box<Sleep>>,
     reset_on_next_logon: bool,
+    wire_observer: WireObserverHandle,
 }
 
 impl<App, Store> Session<App, Store>
@@ -75,6 +77,7 @@ where
         config: SessionConfig,
         application: App,
         store: Store,
+        wire_observer: WireObserverHandle,
     ) -> Result<Session<App, Store>, SessionCreationError> {
         let schedule_check_timer = sleep(Duration::from_secs(SCHEDULE_CHECK_INTERVAL));
 
@@ -96,6 +99,7 @@ where
             state: SessionState::new_disconnected(true, "initialising"),
             schedule_check_timer: Box::pin(schedule_check_timer),
             reset_on_next_logon: false,
+            wire_observer,
         };
 
         Ok(session)
@@ -118,6 +122,9 @@ where
         &mut self,
         raw_message: RawFixMessage,
     ) -> Result<(), SessionOperationError> {
+        if let Some(observer) = &self.wire_observer {
+            observer.on_inbound_bytes(raw_message.as_bytes());
+        }
         debug!("received message: {}", raw_message);
         if !self.state.is_expecting_test_response() {
             // if we are not awaiting a specific test response, any message can reset the timer
@@ -933,6 +940,7 @@ mod tests {
             state,
             schedule_check_timer: Box::pin(sleep(Duration::from_secs(1))),
             reset_on_next_logon: false,
+            wire_observer: None,
         }
     }
 

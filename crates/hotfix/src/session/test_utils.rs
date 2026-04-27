@@ -145,6 +145,7 @@ pub(crate) fn create_test_session_ref() -> (
         event_sender,
         outbound_message_sender,
         admin_request_sender,
+        wire_observer: None,
     };
 
     (session_ref, event_receiver)

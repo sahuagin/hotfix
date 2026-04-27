@@ -19,6 +19,7 @@ use crate::session::event::ScheduleResponse;
 use crate::session::{InternalSessionRef, SessionHandle};
 use crate::store::MessageStore;
 use crate::transport::connect;
+use crate::wire_observer::WireObserverHandle;
 
 #[derive(Clone)]
 pub struct Initiator<Outbound> {
@@ -33,7 +34,26 @@ impl<Outbound: OutboundMessage> Initiator<Outbound> {
         application: impl Application<Outbound = Outbound>,
         store: impl MessageStore + 'static,
     ) -> Result<Self, SessionCreationError> {
-        let session_ref = InternalSessionRef::new(config.clone(), application, store)?;
+        Self::start_with_observer(config, application, store, None).await
+    }
+
+    /// Variant of [`Initiator::start`] that installs a [`crate::WireObserver`].
+    /// The observer fires for every inbound and outbound message that
+    /// crosses the session boundary, including admin/session messages
+    /// (Logon, Heartbeat, Logout, Reject, ResendRequest, SequenceReset,
+    /// TestRequest) which the [`Application`] trait does not surface.
+    pub async fn start_with_observer(
+        config: SessionConfig,
+        application: impl Application<Outbound = Outbound>,
+        store: impl MessageStore + 'static,
+        wire_observer: WireObserverHandle,
+    ) -> Result<Self, SessionCreationError> {
+        let session_ref = InternalSessionRef::new_with_observer(
+            config.clone(),
+            application,
+            store,
+            wire_observer,
+        )?;
         let (completion_tx, completion_rx) = watch::channel(false);
 
         tokio::spawn({

@@ -1,19 +1,23 @@
 use std::time::Duration;
 
 use crate::transport::writer::{WriterMessage, WriterRef};
+use crate::wire_observer::WireObserverHandle;
 use tokio::io::{AsyncWrite, AsyncWriteExt, WriteHalf};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, warn};
 
 const WRITER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
-pub fn spawn_socket_writer<W>(writer: WriteHalf<W>) -> (WriterRef, oneshot::Receiver<()>)
+pub fn spawn_socket_writer<W>(
+    writer: WriteHalf<W>,
+    wire_observer: WireObserverHandle,
+) -> (WriterRef, oneshot::Receiver<()>)
 where
     W: AsyncWrite + Send + 'static,
 {
     let (sender, mailbox) = mpsc::channel(10);
     let (exit_tx, exit_rx) = oneshot::channel();
-    let actor = WriterActor::new(writer, mailbox);
+    let actor = WriterActor::new(writer, mailbox, wire_observer);
     tokio::spawn(run_writer(actor, exit_tx));
 
     (WriterRef::new(sender), exit_rx)
@@ -22,18 +26,32 @@ where
 struct WriterActor<W> {
     writer: WriteHalf<W>,
     mailbox: mpsc::Receiver<WriterMessage>,
+    wire_observer: WireObserverHandle,
 }
 
 impl<W: AsyncWrite> WriterActor<W> {
-    fn new(writer: WriteHalf<W>, mailbox: mpsc::Receiver<WriterMessage>) -> Self {
-        Self { writer, mailbox }
+    fn new(
+        writer: WriteHalf<W>,
+        mailbox: mpsc::Receiver<WriterMessage>,
+        wire_observer: WireObserverHandle,
+    ) -> Self {
+        Self {
+            writer,
+            mailbox,
+            wire_observer,
+        }
     }
 
     async fn handle(&mut self, message: WriterMessage) -> bool {
         match message {
             WriterMessage::SendMessage(fix_message) => {
                 match self.writer.write_all(fix_message.as_bytes()).await {
-                    Ok(_) => debug!("sent message: {}", fix_message),
+                    Ok(_) => {
+                        if let Some(observer) = &self.wire_observer {
+                            observer.on_outbound_bytes(fix_message.as_bytes());
+                        }
+                        debug!("sent message: {}", fix_message);
+                    }
                     // we don't shut down the writer due to errors, only when explicitly requested
                     // a broken connection is shut down via the reader -> session -> writer route
                     Err(_) => warn!("failed to send message: {}", fix_message),
@@ -76,7 +94,7 @@ mod tests {
     async fn test_send_single_message() {
         let (reader, writer) = duplex(1024);
         let (_reader_half, writer_half) = tokio::io::split(writer);
-        let (writer_ref, _exit_rx) = spawn_socket_writer(writer_half);
+        let (writer_ref, _exit_rx) = spawn_socket_writer(writer_half, None);
 
         let fix_message = b"8=FIX.4.4\x019=77\x0135=A\x0134=1\x0149=sender\x0152=20230908-08:24:56.574\x0156=target\x0198=0\x01108=30\x01141=Y\x0110=037\x01";
         let raw_message = RawFixMessage::new(fix_message.to_vec());
@@ -102,7 +120,7 @@ mod tests {
     async fn test_send_multiple_messages() {
         let (reader, writer) = duplex(2048);
         let (_reader_half, writer_half) = tokio::io::split(writer);
-        let (writer_ref, _exit_rx) = spawn_socket_writer(writer_half);
+        let (writer_ref, _exit_rx) = spawn_socket_writer(writer_half, None);
 
         let msg1 = b"8=FIX.4.4\x019=77\x0135=A\x0134=1\x0149=sender\x0152=20230908-08:24:56.574\x0156=target\x0198=0\x01108=30\x01141=Y\x0110=037\x01";
         let msg2 = b"8=FIX.4.4\x019=77\x0135=A\x0134=2\x0149=sender\x0152=20230908-08:24:58.574\x0156=target\x0198=0\x01108=30\x01141=Y\x0110=040\x01";
@@ -143,7 +161,7 @@ mod tests {
     async fn test_disconnect() {
         let (reader, writer) = duplex(1024);
         let (_reader_half, writer_half) = tokio::io::split(writer);
-        let (writer_ref, _exit_rx) = spawn_socket_writer(writer_half);
+        let (writer_ref, _exit_rx) = spawn_socket_writer(writer_half, None);
 
         // send a message first
         let fix_message = b"8=FIX.4.4\x019=77\x0135=A\x0134=1\x0149=sender\x0152=20230908-08:24:56.574\x0156=target\x0198=0\x01108=30\x01141=Y\x0110=037\x01";
@@ -173,7 +191,7 @@ mod tests {
     async fn test_send_empty_message() {
         let (reader, writer) = duplex(1024);
         let (_reader_half, writer_half) = tokio::io::split(writer);
-        let (writer_ref, _exit_rx) = spawn_socket_writer(writer_half);
+        let (writer_ref, _exit_rx) = spawn_socket_writer(writer_half, None);
 
         let empty_message = RawFixMessage::new(vec![]);
         writer_ref.send_raw_message(empty_message).await;
@@ -205,7 +223,7 @@ mod tests {
     async fn test_writer_shutdown_on_mailbox_close() {
         let (_reader, writer) = duplex(1024);
         let (_reader_half, writer_half) = tokio::io::split(writer);
-        let (writer_ref, _exit_rx) = spawn_socket_writer(writer_half);
+        let (writer_ref, _exit_rx) = spawn_socket_writer(writer_half, None);
 
         // send a message to ensure the writer is running
         let fix_message = b"8=FIX.4.4\x019=77\x0135=A\x0134=1\x0149=sender\x0152=20230908-08:24:56.574\x0156=target\x0198=0\x01108=30\x01141=Y\x0110=037\x01";
@@ -228,7 +246,7 @@ mod tests {
     async fn test_write_error_handling() {
         let (reader, writer) = duplex(1024);
         let (_reader_half, writer_half) = tokio::io::split(writer);
-        let (writer_ref, _exit_rx) = spawn_socket_writer(writer_half);
+        let (writer_ref, _exit_rx) = spawn_socket_writer(writer_half, None);
 
         // close the reader end, which should cause write errors
         drop(reader);
@@ -256,7 +274,7 @@ mod tests {
     async fn shutdown_called_on_disconnect() {
         let (reader, writer) = duplex(1024);
         let (_reader_half, writer_half) = tokio::io::split(writer);
-        let (writer_ref, exit_rx) = spawn_socket_writer(writer_half);
+        let (writer_ref, exit_rx) = spawn_socket_writer(writer_half, None);
 
         writer_ref.disconnect().await;
 
@@ -284,7 +302,7 @@ mod tests {
     async fn exit_signal_fires_when_all_senders_dropped() {
         let (_reader, writer) = duplex(1024);
         let (_reader_half, writer_half) = tokio::io::split(writer);
-        let (writer_ref, exit_rx) = spawn_socket_writer(writer_half);
+        let (writer_ref, exit_rx) = spawn_socket_writer(writer_half, None);
 
         drop(writer_ref);
 
@@ -327,7 +345,7 @@ mod tests {
         // we wrap with `tokio::io::join` to supply a dummy AsyncRead.
         let stuck = tokio::io::join(tokio::io::empty(), StuckShutdownWriter);
         let (_read_half, write_half) = tokio::io::split(stuck);
-        let (writer_ref, exit_rx) = spawn_socket_writer(write_half);
+        let (writer_ref, exit_rx) = spawn_socket_writer(write_half, None);
 
         writer_ref.disconnect().await;
 
