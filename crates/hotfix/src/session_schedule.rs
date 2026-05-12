@@ -1,6 +1,6 @@
 use crate::config::ScheduleConfig;
 use crate::session::error::SessionCreationError;
-use chrono::{DateTime, Datelike, Days, NaiveDate, NaiveTime, TimeDelta, Utc, Weekday};
+use chrono::{DateTime, Datelike, Days, NaiveDate, NaiveTime, TimeDelta, Timelike, Utc, Weekday};
 use chrono_tz::Tz;
 use thiserror::Error;
 
@@ -46,7 +46,6 @@ pub enum SessionSchedule {
         weekdays: Vec<Weekday>,
         timezone: Tz,
     },
-    #[allow(dead_code)]
     Weekly {
         start_day: Weekday,
         start_time: NaiveTime,
@@ -77,7 +76,22 @@ impl SessionSchedule {
                 let adjusted_datetime = datetime.with_timezone(timezone);
                 Self::check_weekdays_schedule(&adjusted_datetime, weekdays, start_time, end_time)
             }
-            SessionSchedule::Weekly { .. } => false,
+            SessionSchedule::Weekly {
+                start_day,
+                start_time,
+                end_day,
+                end_time,
+                timezone,
+            } => {
+                let adjusted_datetime = datetime.with_timezone(timezone);
+                Self::check_weekly_schedule(
+                    &adjusted_datetime,
+                    start_day,
+                    start_time,
+                    end_day,
+                    end_time,
+                )
+            }
         }
     }
 
@@ -126,7 +140,15 @@ impl SessionSchedule {
                 timezone,
                 weekdays: _,
             } => calculate_single_day_session_bounds(datetime, start_time, end_time, timezone),
-            SessionSchedule::Weekly { .. } => unimplemented!(),
+            SessionSchedule::Weekly {
+                start_day,
+                start_time,
+                end_day,
+                end_time,
+                timezone,
+            } => calculate_weekly_session_bounds(
+                datetime, start_day, start_time, end_day, end_time, timezone,
+            ),
         }
     }
 
@@ -170,15 +192,24 @@ impl SessionSchedule {
         }
     }
 
-    #[allow(unused_variables)]
-    #[allow(dead_code)]
     fn check_weekly_schedule(
-        datetime: &DateTime<Utc>,
-        start_day: Weekday,
-        end_day: Weekday,
+        datetime: &DateTime<Tz>,
+        start_day: &Weekday,
+        start_time: &NaiveTime,
+        end_day: &Weekday,
+        end_time: &NaiveTime,
     ) -> bool {
-        // TODO: implement this
-        false
+        let start_pos = weekly_seconds(start_day, start_time);
+        let end_pos = weekly_seconds(end_day, end_time);
+        let now_pos = weekly_seconds(&datetime.weekday(), &datetime.time());
+
+        if start_pos < end_pos {
+            // e.g., Mon 09:00 → Fri 17:00
+            start_pos <= now_pos && now_pos < end_pos
+        } else {
+            // e.g., Sun 18:00 → Fri 17:00
+            now_pos >= start_pos || now_pos < end_pos
+        }
     }
 }
 
@@ -246,17 +277,23 @@ impl TryFrom<&ScheduleConfig> for SessionSchedule {
                     ));
                 }
 
-                let _ = SessionSchedule::Weekly {
+                if start_day == end_day && start < end {
+                    return Err(SessionCreationError::InvalidSchedule(
+                        "Incorrect weekly schedule: start time must be after end time for same day weekly schedule".to_string(),
+                    ));
+                }
+
+                if start_day == end_day && start == end {
+                    return Ok(SessionSchedule::NonStop);
+                }
+
+                Ok(SessionSchedule::Weekly {
                     start_day: *start_day,
                     start_time: *start,
                     end_day: *end_day,
                     end_time: *end,
                     timezone: timezone.unwrap_or(Tz::UTC),
-                };
-
-                Err(SessionCreationError::InvalidSchedule(
-                    "weekly sessions are not supported yet".to_string(),
-                ))
+                })
             }
 
             // Invalid combinations
@@ -276,6 +313,11 @@ impl TryFrom<Option<&ScheduleConfig>> for SessionSchedule {
             Some(session_config) => session_config.try_into(),
         }
     }
+}
+
+/// Linear coordinate of a (weekday, time) pair as seconds since Monday 00:00.
+fn weekly_seconds(day: &Weekday, time: &NaiveTime) -> u32 {
+    day.num_days_from_monday() * 86_400 + time.num_seconds_from_midnight()
 }
 
 fn construct_utc(
@@ -333,10 +375,71 @@ fn calculate_single_day_session_bounds(
     }
 }
 
+fn calculate_weekly_session_bounds(
+    datetime: &DateTime<Utc>,
+    start_day: &Weekday,
+    start_time: &NaiveTime,
+    end_day: &Weekday,
+    end_time: &NaiveTime,
+    timezone: &Tz,
+) -> Result<(DateTime<Utc>, DateTime<Utc>), ScheduleError> {
+    let local_datetime = datetime.with_timezone(timezone);
+
+    let days_back: u64 = {
+        let curr = local_datetime.weekday().num_days_from_monday() as i64;
+        let start = start_day.num_days_from_monday() as i64;
+        let diff = (curr - start).rem_euclid(7) as u64;
+
+        if diff == 0 && local_datetime.time() < *start_time {
+            7 // i.e. Monday 9 AM -> Monday 3 AM
+        } else {
+            diff
+        }
+    };
+
+    let session_start_date = local_datetime
+        .date_naive()
+        .checked_sub_days(Days::new(days_back))
+        .ok_or_else(|| ScheduleError::DateCalculationOverflow {
+            context: "failed to compute weekly session start date".to_string(),
+        })?;
+
+    let session_duration: u64 = {
+        let s = start_day.num_days_from_monday() as i64;
+        let e = end_day.num_days_from_monday() as i64;
+        let diff = (e - s).rem_euclid(7) as u64;
+        if diff == 0 && end_time <= start_time {
+            7
+        } else {
+            diff
+        }
+    };
+
+    let end_date = session_start_date
+        .checked_add_days(Days::new(session_duration))
+        .ok_or_else(|| ScheduleError::DateCalculationOverflow {
+            context: "failed to compute weekly session end date".to_string(),
+        })?;
+
+    let start = construct_utc(&session_start_date, start_time, timezone)?;
+    let end = construct_utc(&end_date, end_time, timezone)?;
+    Ok((start, end))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use chrono::{NaiveTime, Weekday};
+
+    fn utc_dt(y: i32, m: u32, d: u32, h: u32, mi: u32, s: u32) -> DateTime<Utc> {
+        DateTime::from_naive_utc_and_offset(
+            NaiveDate::from_ymd_opt(y, m, d)
+                .unwrap()
+                .and_hms_opt(h, mi, s)
+                .unwrap(),
+            Utc,
+        )
+    }
 
     #[test]
     fn test_active_at_non_stop_schedule() {
@@ -1033,28 +1136,37 @@ mod tests {
     }
 
     #[test]
-    fn test_into_weekly_session_not_supported() {
+    fn test_into_weekly_session_valid() {
         let config = ScheduleConfig {
             start_time: Some(NaiveTime::from_hms_opt(18, 0, 0).unwrap()),
             end_time: Some(NaiveTime::from_hms_opt(17, 0, 0).unwrap()),
             start_day: Some(Weekday::Sun),
             end_day: Some(Weekday::Fri),
             weekdays: vec![],
-            timezone: None,
+            timezone: Some(Tz::America__New_York),
         };
 
-        let result = SessionSchedule::try_from(&config);
-        assert!(result.is_err());
-        match result.unwrap_err() {
-            SessionCreationError::InvalidSchedule(msg) => {
-                assert!(msg.contains("weekly sessions are not supported yet"));
+        let schedule = SessionSchedule::try_from(&config).unwrap();
+        match schedule {
+            SessionSchedule::Weekly {
+                start_day,
+                start_time,
+                end_day,
+                end_time,
+                timezone,
+            } => {
+                assert_eq!(start_day, Weekday::Sun);
+                assert_eq!(start_time, NaiveTime::from_hms_opt(18, 0, 0).unwrap());
+                assert_eq!(end_day, Weekday::Fri);
+                assert_eq!(end_time, NaiveTime::from_hms_opt(17, 0, 0).unwrap());
+                assert_eq!(timezone, Tz::America__New_York);
             }
-            other => panic!("unexpected error: {other}"),
+            _ => panic!("Expected Weekly schedule"),
         }
     }
 
     #[test]
-    fn test_into_weekly_session_with_equal_times_not_supported() {
+    fn test_into_weekly_session_equal_times_distinct_days_valid() {
         let time = NaiveTime::from_hms_opt(12, 0, 0).unwrap();
         let config = ScheduleConfig {
             start_time: Some(time),
@@ -1065,14 +1177,55 @@ mod tests {
             timezone: None,
         };
 
+        let schedule = SessionSchedule::try_from(&config).unwrap();
+        assert!(matches!(schedule, SessionSchedule::Weekly { .. }));
+    }
+
+    #[test]
+    fn test_into_weekly_session_same_day_and_start_gt_end_valid() {
+        let start = NaiveTime::from_hms_opt(12, 0, 0).unwrap();
+        let end = NaiveTime::from_hms_opt(9, 0, 0).unwrap();
+        let config = ScheduleConfig {
+            start_time: Some(start),
+            end_time: Some(end),
+            start_day: Some(Weekday::Mon),
+            end_day: Some(Weekday::Mon),
+            weekdays: vec![],
+            timezone: None,
+        };
+
+        let schedule = SessionSchedule::try_from(&config).unwrap();
+        assert!(matches!(schedule, SessionSchedule::Weekly { .. }));
+    }
+
+    #[test]
+    fn test_into_weekly_session_same_day_and_same_time_collapses_to_nonstop() {
+        let config = ScheduleConfig {
+            start_time: Some(NaiveTime::from_hms_opt(9, 0, 0).unwrap()),
+            end_time: Some(NaiveTime::from_hms_opt(9, 0, 0).unwrap()),
+            start_day: Some(Weekday::Mon),
+            end_day: Some(Weekday::Mon),
+            weekdays: vec![],
+            timezone: None,
+        };
+
+        let schedule = SessionSchedule::try_from(&config).unwrap();
+        assert!(matches!(schedule, SessionSchedule::NonStop));
+    }
+
+    #[test]
+    fn test_into_weekly_session_same_day_wrong_time_error() {
+        let config = ScheduleConfig {
+            start_time: Some(NaiveTime::from_hms_opt(1, 0, 0).unwrap()),
+            end_time: Some(NaiveTime::from_hms_opt(9, 0, 0).unwrap()),
+            start_day: Some(Weekday::Mon),
+            end_day: Some(Weekday::Mon),
+            weekdays: vec![],
+            timezone: None,
+        };
+
         let result = SessionSchedule::try_from(&config);
         assert!(result.is_err());
-        match result.unwrap_err() {
-            SessionCreationError::InvalidSchedule(msg) => {
-                assert!(msg.contains("weekly sessions are not supported yet"));
-            }
-            other => panic!("unexpected error: {other}"),
-        }
     }
 
     #[test]
@@ -1476,6 +1629,281 @@ mod tests {
             schedule.is_same_session_period(&dt5, &dt1).unwrap(),
             SessionPeriodComparison::OutsideSessionTime {
                 which: WhichTime::First
+            }
+        ));
+    }
+
+    #[test]
+    fn test_active_at_weekly_schedule_utc() {
+        // Mon 09:00 → Wed 17:00 UTC
+        let schedule = SessionSchedule::Weekly {
+            start_day: Weekday::Mon,
+            start_time: NaiveTime::from_hms_opt(9, 0, 0).unwrap(),
+            end_day: Weekday::Wed,
+            end_time: NaiveTime::from_hms_opt(17, 0, 0).unwrap(),
+            timezone: Tz::UTC,
+        };
+
+        // Sunday before — inactive
+        assert!(!schedule.is_active_at(&utc_dt(2025, 6, 29, 12, 0, 0)));
+        // Monday 8:59:59 — inactive (before start)
+        assert!(!schedule.is_active_at(&utc_dt(2025, 6, 30, 8, 59, 59)));
+        // Monday 9:00:00 — active (inclusive start)
+        assert!(schedule.is_active_at(&utc_dt(2025, 6, 30, 9, 0, 0)));
+        // Tuesday 03:00 — active (mid-session, full day)
+        assert!(schedule.is_active_at(&utc_dt(2025, 7, 1, 3, 0, 0)));
+        // Wednesday 16:59:59 — active
+        assert!(schedule.is_active_at(&utc_dt(2025, 7, 2, 16, 59, 59)));
+        // Wednesday 17:00:00 — inactive (exclusive end)
+        assert!(!schedule.is_active_at(&utc_dt(2025, 7, 2, 17, 0, 0)));
+        // Thursday — inactive
+        assert!(!schedule.is_active_at(&utc_dt(2025, 7, 3, 10, 0, 0)));
+        // Saturday — inactive
+        assert!(!schedule.is_active_at(&utc_dt(2025, 7, 5, 12, 0, 0)));
+    }
+
+    #[test]
+    fn test_active_at_weekly_schedule_24x5_new_york() {
+        // Classic 24/5 FIX trading week: Sun 18:00 → Fri 17:00 New York time.
+        // In January, New York is EST (UTC-5).
+        let schedule = SessionSchedule::Weekly {
+            start_day: Weekday::Sun,
+            start_time: NaiveTime::from_hms_opt(18, 0, 0).unwrap(),
+            end_day: Weekday::Fri,
+            end_time: NaiveTime::from_hms_opt(17, 0, 0).unwrap(),
+            timezone: Tz::America__New_York,
+        };
+
+        // Sun Jan 12, 2025 22:59:59 UTC = 17:59:59 NY — just before start
+        assert!(!schedule.is_active_at(&utc_dt(2025, 1, 12, 22, 59, 59)));
+        // Sun Jan 12, 2025 23:00:01 UTC = 18:00:01 NY — just after start
+        assert!(schedule.is_active_at(&utc_dt(2025, 1, 12, 23, 0, 1)));
+        // Wed Jan 15, 2025 12:00 UTC = 07:00 NY — mid session
+        assert!(schedule.is_active_at(&utc_dt(2025, 1, 15, 12, 0, 0)));
+        // Fri Jan 17, 2025 21:59:59 UTC = 16:59:59 NY — just before end
+        assert!(schedule.is_active_at(&utc_dt(2025, 1, 17, 21, 59, 59)));
+        // Fri Jan 17, 2025 22:00:00 UTC = 17:00:00 NY — at end (exclusive)
+        assert!(!schedule.is_active_at(&utc_dt(2025, 1, 17, 22, 0, 0)));
+        // Sat Jan 18, 2025 12:00 UTC = 07:00 NY Sat — outside session window
+        assert!(!schedule.is_active_at(&utc_dt(2025, 1, 18, 12, 0, 0)));
+        // Sun Jan 19, 2025 12:00 UTC = 07:00 NY Sun — before next session
+        assert!(!schedule.is_active_at(&utc_dt(2025, 1, 19, 12, 0, 0)));
+    }
+
+    #[test]
+    fn test_active_at_weekly_schedule_london() {
+        // Mon 09:00 → Fri 17:00 London time. June 2025: London is UTC+1 (BST).
+        let schedule = SessionSchedule::Weekly {
+            start_day: Weekday::Mon,
+            start_time: NaiveTime::from_hms_opt(9, 0, 0).unwrap(),
+            end_day: Weekday::Fri,
+            end_time: NaiveTime::from_hms_opt(17, 0, 0).unwrap(),
+            timezone: Tz::Europe__London,
+        };
+
+        // Mon Jun 30, 2025 07:59:59 UTC = 08:59:59 London — before start
+        assert!(!schedule.is_active_at(&utc_dt(2025, 6, 30, 7, 59, 59)));
+        // Mon Jun 30, 2025 08:00:01 UTC = 09:00:01 London — after start
+        assert!(schedule.is_active_at(&utc_dt(2025, 6, 30, 8, 0, 1)));
+        // Fri Jul 4, 2025 15:59:59 UTC = 16:59:59 London — just before end
+        assert!(schedule.is_active_at(&utc_dt(2025, 7, 4, 15, 59, 59)));
+        // Fri Jul 4, 2025 16:00:00 UTC = 17:00:00 London — at end (exclusive)
+        assert!(!schedule.is_active_at(&utc_dt(2025, 7, 4, 16, 0, 0)));
+    }
+
+    #[test]
+    fn test_active_at_weekly_schedule_short_window() {
+        // Short cross-day window: Tue 22:00 → Wed 06:00 UTC (8h, crosses midnight)
+        let schedule = SessionSchedule::Weekly {
+            start_day: Weekday::Tue,
+            start_time: NaiveTime::from_hms_opt(22, 0, 0).unwrap(),
+            end_day: Weekday::Wed,
+            end_time: NaiveTime::from_hms_opt(6, 0, 0).unwrap(),
+            timezone: Tz::UTC,
+        };
+
+        // Tue 21:59:59 — inactive
+        assert!(!schedule.is_active_at(&utc_dt(2025, 7, 1, 21, 59, 59)));
+        // Tue 22:00:00 — active
+        assert!(schedule.is_active_at(&utc_dt(2025, 7, 1, 22, 0, 0)));
+        // Tue 23:30 — active
+        assert!(schedule.is_active_at(&utc_dt(2025, 7, 1, 23, 30, 0)));
+        // Wed 02:00 — active (across midnight)
+        assert!(schedule.is_active_at(&utc_dt(2025, 7, 2, 2, 0, 0)));
+        // Wed 05:59:59 — active
+        assert!(schedule.is_active_at(&utc_dt(2025, 7, 2, 5, 59, 59)));
+        // Wed 06:00:00 — inactive (exclusive end)
+        assert!(!schedule.is_active_at(&utc_dt(2025, 7, 2, 6, 0, 0)));
+        // Wed 12:00 — inactive
+        assert!(!schedule.is_active_at(&utc_dt(2025, 7, 2, 12, 0, 0)));
+    }
+
+    #[test]
+    fn test_active_at_weekly_schedule_full_week_minus_gap() {
+        // Very wide window: Mon 02:00 → Sun 23:00 UTC
+        let schedule = SessionSchedule::Weekly {
+            start_day: Weekday::Mon,
+            start_time: NaiveTime::from_hms_opt(2, 0, 0).unwrap(),
+            end_day: Weekday::Sun,
+            end_time: NaiveTime::from_hms_opt(23, 0, 0).unwrap(),
+            timezone: Tz::UTC,
+        };
+
+        // Mon 01:59:59 — inactive (just before start)
+        assert!(!schedule.is_active_at(&utc_dt(2025, 6, 30, 1, 59, 59)));
+        // Mon 02:00:00 — active
+        assert!(schedule.is_active_at(&utc_dt(2025, 6, 30, 2, 0, 0)));
+        // Mid-week — active
+        assert!(schedule.is_active_at(&utc_dt(2025, 7, 2, 12, 0, 0)));
+        // Sat — active
+        assert!(schedule.is_active_at(&utc_dt(2025, 7, 5, 18, 0, 0)));
+        // Sun 22:59:59 — active
+        assert!(schedule.is_active_at(&utc_dt(2025, 7, 6, 22, 59, 59)));
+        // Sun 23:00:00 — inactive (exclusive end)
+        assert!(!schedule.is_active_at(&utc_dt(2025, 7, 6, 23, 0, 0)));
+    }
+
+    #[test]
+    fn test_is_same_session_period_weekly_utc() {
+        // Mon 09:00 → Fri 17:00 UTC
+        let schedule = SessionSchedule::Weekly {
+            start_day: Weekday::Mon,
+            start_time: NaiveTime::from_hms_opt(9, 0, 0).unwrap(),
+            end_day: Weekday::Fri,
+            end_time: NaiveTime::from_hms_opt(17, 0, 0).unwrap(),
+            timezone: Tz::UTC,
+        };
+
+        let dt_mon = utc_dt(2025, 6, 30, 10, 0, 0);
+        let dt_thu = utc_dt(2025, 7, 3, 15, 0, 0);
+        assert_eq!(
+            schedule.is_same_session_period(&dt_mon, &dt_thu).unwrap(),
+            SessionPeriodComparison::SamePeriod
+        );
+        assert_eq!(
+            schedule.is_same_session_period(&dt_thu, &dt_mon).unwrap(),
+            SessionPeriodComparison::SamePeriod
+        );
+
+        // Same time-of-week but next week's session → DifferentPeriod
+        let dt_mon_next = utc_dt(2025, 7, 7, 10, 0, 0);
+        assert_eq!(
+            schedule
+                .is_same_session_period(&dt_mon, &dt_mon_next)
+                .unwrap(),
+            SessionPeriodComparison::DifferentPeriod
+        );
+
+        // Saturday during the gap → OutsideSessionTime
+        let dt_sat = utc_dt(2025, 7, 5, 12, 0, 0);
+        assert!(matches!(
+            schedule.is_same_session_period(&dt_mon, &dt_sat).unwrap(),
+            SessionPeriodComparison::OutsideSessionTime {
+                which: WhichTime::Second
+            }
+        ));
+        assert!(matches!(
+            schedule.is_same_session_period(&dt_sat, &dt_mon).unwrap(),
+            SessionPeriodComparison::OutsideSessionTime {
+                which: WhichTime::First
+            }
+        ));
+    }
+
+    #[test]
+    fn test_is_same_session_period_weekly_at_boundary() {
+        // Mon 09:00 → Fri 17:00 UTC — verify last-second/first-second of consecutive sessions
+        // are classified as DifferentPeriod.
+        let schedule = SessionSchedule::Weekly {
+            start_day: Weekday::Mon,
+            start_time: NaiveTime::from_hms_opt(9, 0, 0).unwrap(),
+            end_day: Weekday::Fri,
+            end_time: NaiveTime::from_hms_opt(17, 0, 0).unwrap(),
+            timezone: Tz::UTC,
+        };
+
+        // Last active second of week-of-Jun-30 vs first active second of next week.
+        let last_sec = utc_dt(2025, 7, 4, 16, 59, 59);
+        let next_first = utc_dt(2025, 7, 7, 9, 0, 0);
+        assert_eq!(
+            schedule
+                .is_same_session_period(&last_sec, &next_first)
+                .unwrap(),
+            SessionPeriodComparison::DifferentPeriod
+        );
+    }
+
+    #[test]
+    fn test_is_same_session_period_weekly_24x5_newyork_across_weeks() {
+        // Sun 18:00 → Fri 17:00 New York (wrap case). Verify two times that wrap across the
+        // calendar week into the same session window are classified as SamePeriod.
+        let schedule = SessionSchedule::Weekly {
+            start_day: Weekday::Sun,
+            start_time: NaiveTime::from_hms_opt(18, 0, 0).unwrap(),
+            end_day: Weekday::Fri,
+            end_time: NaiveTime::from_hms_opt(17, 0, 0).unwrap(),
+            timezone: Tz::America__New_York,
+        };
+
+        // Sun Jan 12 23:30 UTC = Sun 18:30 NY — start of session
+        let dt_sun = utc_dt(2025, 1, 12, 23, 30, 0);
+        // Wed Jan 15 14:00 UTC = Wed 09:00 NY — mid session
+        let dt_wed = utc_dt(2025, 1, 15, 14, 0, 0);
+        // Fri Jan 17 21:00 UTC = Fri 16:00 NY — near end of same session
+        let dt_fri = utc_dt(2025, 1, 17, 21, 0, 0);
+
+        assert_eq!(
+            schedule.is_same_session_period(&dt_sun, &dt_wed).unwrap(),
+            SessionPeriodComparison::SamePeriod
+        );
+        assert_eq!(
+            schedule.is_same_session_period(&dt_wed, &dt_fri).unwrap(),
+            SessionPeriodComparison::SamePeriod
+        );
+        assert_eq!(
+            schedule.is_same_session_period(&dt_sun, &dt_fri).unwrap(),
+            SessionPeriodComparison::SamePeriod
+        );
+
+        // Following week's Monday (= same session continues from Sun Jan 19 18:00 NY)
+        // Sun Jan 19 23:30 UTC = Sun 18:30 NY — start of NEXT session
+        let dt_sun_next = utc_dt(2025, 1, 19, 23, 30, 0);
+        assert_eq!(
+            schedule
+                .is_same_session_period(&dt_sun, &dt_sun_next)
+                .unwrap(),
+            SessionPeriodComparison::DifferentPeriod
+        );
+    }
+
+    #[test]
+    fn test_is_same_session_period_weekly_within_wrap() {
+        // Sun 18:00 → Fri 17:00 UTC (wrap). Use UTC to avoid TZ confusion in the assertions.
+        let schedule = SessionSchedule::Weekly {
+            start_day: Weekday::Sun,
+            start_time: NaiveTime::from_hms_opt(18, 0, 0).unwrap(),
+            end_day: Weekday::Fri,
+            end_time: NaiveTime::from_hms_opt(17, 0, 0).unwrap(),
+            timezone: Tz::UTC,
+        };
+
+        // Two times that span the calendar week boundary (Sun → Mon) but within the same
+        // weekly session — must be SamePeriod.
+        let sun_eve = utc_dt(2025, 6, 29, 19, 0, 0); // Sunday after start
+        let mon_morning = utc_dt(2025, 6, 30, 8, 0, 0); // Monday early — same session
+        assert_eq!(
+            schedule
+                .is_same_session_period(&sun_eve, &mon_morning)
+                .unwrap(),
+            SessionPeriodComparison::SamePeriod
+        );
+
+        // Saturday in the gap → OutsideSessionTime
+        let sat = utc_dt(2025, 7, 5, 12, 0, 0);
+        assert!(matches!(
+            schedule.is_same_session_period(&sun_eve, &sat).unwrap(),
+            SessionPeriodComparison::OutsideSessionTime {
+                which: WhichTime::Second
             }
         ));
     }
