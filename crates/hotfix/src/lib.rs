@@ -29,10 +29,12 @@ pub mod session;
 mod session_schedule;
 pub mod store;
 pub mod transport;
+pub mod wire_observer;
 
 pub use application::Application;
 pub use hotfix_message::field_types;
 pub use hotfix_message::message::Message;
+pub use wire_observer::{WireObserver, WireObserverHandle};
 
 #[cfg(feature = "fix44")]
 pub use hotfix_message::fix44;
