@@ -7,6 +7,7 @@
 //! the peer, and sends the initial Logon (35=A) message. For transport,
 //! `HotFIX` supports plain TCP and encrypted TLS over TCP connections.
 use std::time::Duration;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::watch;
 use tokio::time::sleep;
 use tracing::{debug, warn};
@@ -18,7 +19,7 @@ use crate::session::error::{SendError, SendOutcome, SessionCreationError};
 use crate::session::event::ScheduleResponse;
 use crate::session::{InternalSessionRef, SessionHandle};
 use crate::store::MessageStore;
-use crate::transport::connect;
+use crate::transport::{connect, connect_over_stream};
 use crate::wire_observer::WireObserverHandle;
 
 #[derive(Clone)]
@@ -69,6 +70,57 @@ impl<Outbound: OutboundMessage> Initiator<Outbound> {
         };
 
         Ok(initiator)
+    }
+
+    /// One-shot variant of [`Initiator::start_with_observer`] that drives a
+    /// session over a **provided** byte stream instead of opening a network
+    /// connection — for replaying a capture (or a pcap) through the real engine.
+    ///
+    /// There is no connect step and no reconnect loop: when the stream reaches
+    /// EOF the session disconnects and completion is signalled (observe via
+    /// [`Initiator::wait_for_shutdown`]). The [`WireObserver`](crate::WireObserver)
+    /// is the per-message hook callers use to convert each message that crosses
+    /// the session boundary into whatever output they want (JSONL, pretty FIX,
+    /// typed events) — one parser (the engine), swappable output.
+    pub async fn start_over_stream<Stream>(
+        config: SessionConfig,
+        application: impl Application<Outbound = Outbound>,
+        store: impl MessageStore + 'static,
+        wire_observer: WireObserverHandle,
+        stream: Stream,
+    ) -> Result<Self, SessionCreationError>
+    where
+        Stream: AsyncRead + AsyncWrite + Send + 'static,
+    {
+        let session_ref = InternalSessionRef::new_with_observer(
+            config.clone(),
+            application,
+            store,
+            wire_observer,
+        )?;
+        let (completion_tx, completion_rx) = watch::channel(false);
+
+        tokio::spawn({
+            let session_ref = session_ref.clone();
+            async move {
+                let conn = connect_over_stream(session_ref.clone(), stream).await;
+                if session_ref
+                    .register_writer(conn.get_writer())
+                    .await
+                    .is_err()
+                {
+                    warn!("replay session terminated when registering writer");
+                }
+                conn.run_until_disconnect().await;
+                let _ = completion_tx.send(true);
+            }
+        });
+
+        Ok(Self {
+            config,
+            session_handle: session_ref.into(),
+            completion_rx,
+        })
     }
 
     /// Sends a message and waits for confirmation that it was persisted.
@@ -367,6 +419,93 @@ mod tests {
         assert!(!initiator.is_shutdown());
         assert!(initiator.is_interested("TEST-SENDER", "TEST-TARGET"));
         assert!(!initiator.is_interested("WRONG", "TEST-TARGET"));
+    }
+
+    /// `start_over_stream` drives the real engine over a *provided* stream — here
+    /// an in-memory `duplex` standing in for a replayed capture — with no TCP
+    /// connect and no reconnect. The `WireObserver` fires for every inbound
+    /// message *before parsing*, so it captures the replayed traffic regardless
+    /// of session-level acceptance: the decode path is "feed bytes through the
+    /// engine, convert in the observer/callback", not a second parser.
+    #[tokio::test]
+    async fn start_over_stream_replays_a_capture_and_observes_it() {
+        use std::sync::{Arc, Mutex};
+        use tokio::io::{duplex, split};
+
+        #[derive(Default)]
+        struct Capturing {
+            inbound: Mutex<Vec<Vec<u8>>>,
+        }
+        impl crate::wire_observer::WireObserver for Capturing {
+            fn on_inbound_bytes(&self, bytes: &[u8]) {
+                self.inbound
+                    .lock()
+                    .expect("observer lock")
+                    .push(bytes.to_vec());
+            }
+        }
+
+        let config = create_test_config("replay", 0);
+        let observer = Arc::new(Capturing::default());
+        // `engine_side` is handed to the engine; `peer` is our replay source.
+        let (peer, engine_side) = duplex(8192);
+        let (mut peer_read, mut peer_write) = split(peer);
+
+        let initiator = Initiator::<DummyMessage>::start_over_stream(
+            config.clone(),
+            NoOpApp,
+            InMemoryMessageStore::default(),
+            Some(observer.clone()),
+            engine_side,
+        )
+        .await
+        .expect("start_over_stream");
+
+        // Drain the session's own outbound (its Logon/heartbeats) so the duplex
+        // never backs up; we only assert on the inbound replay.
+        tokio::spawn(async move {
+            let mut sink = [0u8; 4096];
+            while let Ok(n) = peer_read.read(&mut sink).await {
+                if n == 0 {
+                    break;
+                }
+            }
+        });
+
+        // Replay the counterparty's Logon (comp IDs from the counterparty's view).
+        let logon = generate_message(
+            "FIX.4.4",
+            &config.target_comp_id,
+            &config.sender_comp_id,
+            1,
+            Logon::new(30, ResetSeqNumConfig::NoReset(None)),
+        )
+        .expect("generate replay logon");
+        peer_write.write_all(&logon).await.expect("replay write");
+
+        // The observer fires on the framed inbound message; poll briefly.
+        let mut captured = false;
+        for _ in 0..50 {
+            if observer
+                .inbound
+                .lock()
+                .expect("observer lock")
+                .iter()
+                .any(|b| String::from_utf8_lossy(b).contains("\x0135=A\x01"))
+            {
+                captured = true;
+                break;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            captured,
+            "WireObserver should capture the replayed Logon (35=A) off the provided stream"
+        );
+
+        // EOF the replay -> session disconnects -> completion signalled.
+        drop(peer_write);
+        let _ = tokio::time::timeout(Duration::from_secs(2), initiator.wait_for_shutdown()).await;
     }
 
     #[tokio::test]
