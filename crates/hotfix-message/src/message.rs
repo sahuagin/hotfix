@@ -119,16 +119,37 @@ impl Part for Message {
 #[derive(Clone, Copy)]
 pub struct Config {
     pub(crate) separator: u8,
+    /// Diagnostic/lenient parsing: tolerate unknown tags (store them on the
+    /// message instead of rejecting with `InvalidField`) so tooling — fix-tail,
+    /// fix-convert, dashboards — can decode captures that carry tags absent from
+    /// the dictionary. The session/trading path uses `Default` (strict), so this
+    /// never affects live message handling. (spline-connect-1be.1)
+    pub(crate) lenient: bool,
 }
 
 impl Config {
     pub const fn with_separator(separator: u8) -> Self {
-        Self { separator }
+        Self {
+            separator,
+            lenient: false,
+        }
+    }
+
+    /// Strict default separator with lenient parsing enabled. For diagnostic /
+    /// replay tooling only — never use on the trading-engine path.
+    pub const fn lenient() -> Self {
+        Self {
+            separator: SOH,
+            lenient: true,
+        }
     }
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Self { separator: SOH }
+        Self {
+            separator: SOH,
+            lenient: false,
+        }
     }
 }
