@@ -28,16 +28,24 @@ pub async fn connect(
             tls_config,
         )
         .await?;
-        _create_io_refs(session_ref.clone(), stream).await
+        connect_over_stream(session_ref.clone(), stream).await
     } else {
         let stream = create_tcp_connection(&config.connection_host, config.connection_port).await?;
-        _create_io_refs(session_ref.clone(), stream).await
+        connect_over_stream(session_ref.clone(), stream).await
     };
 
     Ok(conn)
 }
 
-async fn _create_io_refs<Outbound, Stream>(
+/// Wire a [`FixConnection`] over an already-established byte stream: split it,
+/// spawn the reader/writer actors, and return the connection.
+///
+/// This is the transport-agnostic half of [`connect`] — it accepts any
+/// `AsyncRead + AsyncWrite`, so it serves both a live TCP/TLS socket and a
+/// replay source (a capture or pcap fed through an in-memory stream). Exposed
+/// so callers can drive a session over a provided stream without opening a
+/// network connection (decode/replay tooling).
+pub async fn connect_over_stream<Outbound, Stream>(
     session_ref: InternalSessionRef<Outbound>,
     stream: Stream,
 ) -> FixConnection
