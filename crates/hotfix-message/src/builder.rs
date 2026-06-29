@@ -197,30 +197,45 @@ impl MessageBuilder {
         let mut body = Body::default();
         let mut field = next_field;
 
-        while message_def.contains_tag(field.tag) {
-            let tag = field.tag;
-            body.store_field(field);
-
-            // check if it's the start of a group and parse the group as needed
-            let field_def = self.get_dict_field_by_tag(tag.get())?;
-            match message_def.get_group(tag) {
-                Some(group_def) => {
-                    let (groups, next) = Self::parse_groups(parser, group_def, field_def.tag())?;
-                    #[allow(clippy::expect_used)]
-                    body.set_groups(groups)
-                        .expect("groups are guaranteed to be valid at this point");
-                    field = next;
-                }
-                None => {
-                    field = parser.next_field().ok_or(ParserError::Malformed(
-                        "message ended within the body".to_string(),
-                    ))?;
-                }
+        loop {
+            if self.is_trailer_tag(field.tag) {
+                break;
             }
-        }
 
-        if !self.is_trailer_tag(field.tag) {
-            return Err(ParserError::InvalidField(field.tag.get()));
+            if message_def.contains_tag(field.tag) {
+                let tag = field.tag;
+                body.store_field(field);
+
+                // check if it's the start of a group and parse the group as needed
+                let field_def = self.get_dict_field_by_tag(tag.get())?;
+                match message_def.get_group(tag) {
+                    Some(group_def) => {
+                        let (groups, next) =
+                            Self::parse_groups(parser, group_def, field_def.tag())?;
+                        #[allow(clippy::expect_used)]
+                        body.set_groups(groups)
+                            .expect("groups are guaranteed to be valid at this point");
+                        field = next;
+                    }
+                    None => {
+                        field = parser.next_field().ok_or(ParserError::Malformed(
+                            "message ended within the body".to_string(),
+                        ))?;
+                    }
+                }
+            } else if self.config.lenient {
+                // Lenient/diagnostic: tolerate a tag the message definition does
+                // not list — store it raw on the body and keep going, so tooling
+                // can decode captures carrying tags absent from the dictionary
+                // (decode emits these as tag<N>). The strict path still rejects
+                // them via the branch below. (spline-connect-1be.1)
+                body.store_field(field);
+                field = parser.next_field().ok_or(ParserError::Malformed(
+                    "message ended within the body".to_string(),
+                ))?;
+            } else {
+                return Err(ParserError::InvalidField(field.tag.get()));
+            }
         }
 
         Ok((body, field))
@@ -560,6 +575,62 @@ mod tests {
     use hotfix_dictionary::{Dictionary, IsFieldDefinition, TagU32};
 
     const CONFIG: Config = Config::with_separator(b'|');
+
+    /// Frame body field parts (no 8/9/10) into valid SOH-delimited wire bytes,
+    /// recomputing BodyLength + CheckSum so the strict parser accepts the frame.
+    fn frame(body_parts: &[&str]) -> Vec<u8> {
+        let mut body = Vec::new();
+        for p in body_parts {
+            body.extend_from_slice(p.as_bytes());
+            body.push(0x01);
+        }
+        let mut out = Vec::new();
+        out.extend_from_slice(b"8=FIX.4.4");
+        out.push(0x01);
+        out.extend_from_slice(format!("9={}", body.len()).as_bytes());
+        out.push(0x01);
+        out.extend_from_slice(&body);
+        let cs = out.iter().fold(0u8, |a, &b| a.wrapping_add(b));
+        out.extend_from_slice(format!("10={cs:03}").as_bytes());
+        out.push(0x01);
+        out
+    }
+
+    #[test]
+    fn lenient_config_tolerates_unknown_tags_strict_rejects() {
+        // A Heartbeat (35=0) carrying a tag the dictionary does not list. The
+        // frame is well-formed; only the unknown tag is at issue. (spline-connect-1be.1)
+        let bytes = frame(&[
+            "35=0",
+            "49=A",
+            "56=B",
+            "34=1",
+            "52=20260423-20:28:54.379",
+            "99999=experimental",
+        ]);
+
+        // strict (default) → rejected as an invalid field
+        let strict = MessageBuilder::new(Dictionary::fix44(), Config::default()).unwrap();
+        assert!(
+            !matches!(strict.build(&bytes), ParsedMessage::Valid(_)),
+            "strict build must reject the unknown tag"
+        );
+
+        // lenient → valid, with the unknown tag stored raw on the body
+        let lenient = MessageBuilder::new(Dictionary::fix44(), Config::lenient()).unwrap();
+        match lenient.build(&bytes) {
+            ParsedMessage::Valid(msg) => {
+                assert!(
+                    msg.get_field_map()
+                        .fields
+                        .get(&TagU32::new(99999).unwrap())
+                        .is_some(),
+                    "lenient build should store the unknown tag 99999 on the body"
+                );
+            }
+            _ => panic!("lenient build should accept the message with an unknown tag"),
+        }
+    }
 
     #[test]
     fn test_specification_top_level_fields() {
