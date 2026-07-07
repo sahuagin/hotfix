@@ -71,9 +71,10 @@ impl SessionState {
     pub(crate) async fn on_peer_logon<A: Application, S: MessageStore>(
         &self,
         ctx: &mut SessionCtx<A, S>,
+        message: &Message,
     ) -> Result<TransitionResult, SessionOperationError> {
         match self {
-            Self::AwaitingLogon(state) => state.on_peer_logon(ctx).await,
+            Self::AwaitingLogon(state) => state.on_peer_logon(ctx, message).await,
             _ => {
                 error!("received unexpected logon message");
                 Ok(TransitionResult::Stay)

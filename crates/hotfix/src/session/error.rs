@@ -13,6 +13,9 @@ pub enum SessionCreationError {
     #[error("unsupported BeginString: {0}")]
     UnsupportedBeginString(String),
 
+    #[error("failed to bind acceptor listener: {0}")]
+    Bind(std::io::Error),
+
     #[error("dictionary failed to parse")]
     MalformedDictionary(#[from] hotfix_message::dict::ParseError),
 

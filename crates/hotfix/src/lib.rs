@@ -1,8 +1,11 @@
 //! A [Financial Information eXchange (FIX)](https://www.fixtrading.org/standards/) engine.
 //!
-//! HotFIX is a [FIX](https://www.fixtrading.org/standards/) engine implemented in Rust,
-//! focused on buy-side (initiator) workflows. It fully supports FIX 4.4 and the current
-//! focus is on expanding support to other FIX versions.
+//! HotFIX is a [FIX](https://www.fixtrading.org/standards/) engine implemented in Rust.
+//! It supports both sides of the conversation — buy-side
+//! ([`Initiator`](initiator::Initiator)) and venue/exchange-side
+//! ([`Acceptor`](acceptor::Acceptor)) — over a single symmetric session
+//! layer. It fully supports FIX 4.4 and the current focus is on expanding
+//! support to other FIX versions.
 //!
 //! ### What's working already and short-term roadmap
 //!
@@ -21,6 +24,7 @@
 #![deny(clippy::panic)]
 #![deny(clippy::unwrap_used)]
 
+pub mod acceptor;
 pub mod application;
 pub mod config;
 pub mod initiator;
