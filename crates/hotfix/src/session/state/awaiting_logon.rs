@@ -1,5 +1,6 @@
 use crate::Application;
-use crate::message::logon::Logon;
+use crate::config::SessionRole;
+use crate::message::logon::{Logon, ResetSeqNumConfig};
 use crate::message::resend_request::ResendRequest;
 use crate::message::verification::VerificationFlags;
 use crate::session::ctx::{PreProcessDecision, SessionCtx, TransitionResult, VerificationResult};
@@ -10,7 +11,7 @@ use crate::session::state::{AwaitingResendState, SessionState};
 use crate::transport::writer::WriterRef;
 use hotfix_message::Part;
 use hotfix_message::message::Message;
-use hotfix_message::session_fields::MSG_TYPE;
+use hotfix_message::session_fields::{HEART_BT_INT, MSG_TYPE, RESET_SEQ_NUM_FLAG};
 use hotfix_store::MessageStore;
 use tokio::time::Instant;
 use tracing::debug;
@@ -41,12 +42,41 @@ impl AwaitingLogonState {
     pub(crate) async fn on_peer_logon<A: Application, S: MessageStore>(
         &self,
         ctx: &mut SessionCtx<A, S>,
+        message: &Message,
     ) -> Result<TransitionResult, SessionOperationError> {
+        // The logon asymmetry lives here. An acceptor answers the peer's
+        // Logon before going Active: per spec it adopts the initiator's
+        // HeartBtInt(108), and a 141=Y request is acknowledged with 141=Y
+        // (the store was already reset before verification — see
+        // `process_message`). `logon_sent` guards the initiator path, whose
+        // own Logon went out on connect. The initiator keeps timing
+        // heartbeats off its configured interval, unchanged.
+        let heartbeat_interval = if ctx.config.role == SessionRole::Acceptor {
+            message
+                .get(HEART_BT_INT)
+                .unwrap_or(ctx.config.heartbeat_interval)
+        } else {
+            ctx.config.heartbeat_interval
+        };
+        if ctx.config.role == SessionRole::Acceptor && !self.logon_sent {
+            let reset_config = if message.get(RESET_SEQ_NUM_FLAG).unwrap_or(false) {
+                ResetSeqNumConfig::Reset
+            } else {
+                ResetSeqNumConfig::NoReset(None)
+            };
+            outbound::send_message(
+                ctx,
+                &self.writer,
+                Logon::new(heartbeat_interval, reset_config),
+            )
+            .await
+            .with_send_context("logon reply")?;
+        }
         ctx.application.on_logon().await;
         ctx.store.increment_target_seq_number().await?;
         Ok(TransitionResult::TransitionTo(SessionState::new_active(
             self.writer.clone(),
-            ctx.config.heartbeat_interval,
+            heartbeat_interval,
         )))
     }
 

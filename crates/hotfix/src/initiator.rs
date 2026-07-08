@@ -1,7 +1,7 @@
 //! FIX initiator implementation.
 //!
-//! The fIX session that initiates the connection with its peer,
-//! the acceptor. Currently, `HotFIX` only supports initiators.
+//! The FIX session that initiates the connection with its peer, the
+//! acceptor (see [`crate::acceptor`] for the other side).
 //!
 //! The initiator establishes the transport layer connection with
 //! the peer, and sends the initial Logon (35=A) message. For transport,
@@ -380,6 +380,7 @@ mod tests {
             logout_timeout: 2,
             reconnect_interval: 1, // Short for tests
             reset_on_logon: false,
+            role: Default::default(),
             schedule: None,
         }
     }

@@ -11,6 +11,21 @@ use serde::Deserialize;
 use std::fs;
 use std::path::Path;
 
+/// Which side of the FIX conversation a session is.
+///
+/// The session machinery is symmetric after logon; the role decides who
+/// speaks first. An `Initiator` opens the connection and sends Logon; an
+/// `Acceptor` waits for the peer's Logon and answers it — adopting the
+/// peer's HeartBtInt(108) and honoring ResetSeqNumFlag(141)=Y. Defaults to
+/// `Initiator`, the engine's historical behavior.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionRole {
+    #[default]
+    Initiator,
+    Acceptor,
+}
+
 /// The configuration for multiple sessions.
 #[derive(Clone, Debug, Deserialize)]
 pub struct Config {
@@ -111,6 +126,11 @@ pub struct SessionConfig {
     /// Specifies whether we should reset the state of the message store on logon.
     #[serde(default)]
     pub reset_on_logon: bool,
+    /// Which side of the conversation this session is; defaults to
+    /// `initiator` (see [`SessionRole`]). [`crate::acceptor::Acceptor`]
+    /// forces this to `acceptor` on construction.
+    #[serde(default)]
+    pub role: SessionRole,
 
     /// The schedule configuration for the session
     pub schedule: Option<ScheduleConfig>,
