@@ -294,6 +294,25 @@ impl SessionState {
         A: Application,
         S: MessageStore,
     {
+        // An explicit shutdown must stick even when the connection is already
+        // gone (unclean drop, counterparty restart): there is no writer to
+        // carry a Logout, and without this the pre-drop
+        // `Disconnected { reconnect: true }` survives the request — the
+        // connection loop keeps reconnecting as a zombie behind the caller's
+        // back, racing any replacement session for the counterparty's single
+        // session slot.
+        if let SessionState::Disconnected(state) = self {
+            state.reconnect = reconnect;
+            state.reason = reason.to_string();
+            if !reconnect
+                && let Some(awaiter) = state.take_schedule_awaiter()
+                && awaiter.send(ScheduleResponse::Shutdown).is_err()
+            {
+                error!("failed to notify schedule awaiter of shutdown");
+            }
+            return Ok(TransitionResult::Stay);
+        }
+
         let result = self.try_transition_to_awaiting_logout(
             Duration::from_secs(ctx.config.logout_timeout),
             reconnect,

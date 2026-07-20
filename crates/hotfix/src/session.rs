@@ -53,7 +53,7 @@ use crate::session_schedule::{SessionPeriodComparison, SessionSchedule};
 use crate::store::MessageStore;
 use crate::transport::writer::WriterRef;
 use crate::wire_observer::WireObserverHandle;
-use event::SessionEvent;
+use event::{ScheduleResponse, SessionEvent};
 use hotfix_message::parsed_message::{InvalidReason, ParsedMessage};
 use hotfix_message::session_fields::{
     MSG_SEQ_NUM, MSG_TYPE, RESET_SEQ_NUM_FLAG, SessionRejectReason, TEST_REQ_ID,
@@ -551,7 +551,17 @@ where
                 }
             }
             SessionEvent::AwaitSchedule(responder) => {
-                self.state.register_schedule_awaiter(responder);
+                // A session told not to reconnect must never be handed back
+                // to the connect loop by the next schedule tick — answer
+                // Shutdown at the gate. Without this, a shutdown that lands
+                // while the loop is between connection attempts is
+                // steamrolled by the NEXT connect (which rebuilds state and
+                // forgets the request) — the zombie-reconnect wedge.
+                if self.state.should_reconnect() {
+                    self.state.register_schedule_awaiter(responder);
+                } else if responder.send(ScheduleResponse::Shutdown).is_err() {
+                    warn!("tried to respond Shutdown to AwaitSchedule but the receiver is gone");
+                }
             }
         }
     }
