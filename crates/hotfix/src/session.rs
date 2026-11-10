@@ -251,7 +251,7 @@ where
                 self.on_resend_request(&message).await?;
             }
             Reject::MSG_TYPE => {
-                self.on_reject().await?;
+                self.on_reject(&message).await?;
             }
             SequenceReset::MSG_TYPE => {
                 self.on_sequence_reset(&message).await?;
@@ -439,8 +439,15 @@ where
     }
 
     /// Handle Reject messages.
-    async fn on_reject(&mut self) -> Result<(), SessionOperationError> {
+    /// A session-level Reject (35=3) names one message we sent, by RefSeqNum
+    /// (45), and says why the counterparty refused it (371, 372, 373, 58).
+    /// Only the application knows which order or quote that message was, so
+    /// after the sequence accounting the message is handed to it like an
+    /// application message. The application's decision is not consulted: a
+    /// Reject is never answered, and the session does not disconnect over one.
+    async fn on_reject(&mut self, message: &Message) -> Result<(), SessionOperationError> {
         self.ctx.store.increment_target_seq_number().await?;
+        let _ = self.ctx.application.on_inbound_message(message).await;
         Ok(())
     }
 
@@ -953,6 +960,15 @@ mod tests {
         state: SessionState,
         store: TestStore,
     ) -> Session<NoOpApp, TestStore> {
+        create_test_session_with(NoOpApp, schedule, state, store)
+    }
+
+    fn create_test_session_with<App: Application>(
+        application: App,
+        schedule: SessionSchedule,
+        state: SessionState,
+        store: TestStore,
+    ) -> Session<App, TestStore> {
         let config = create_test_config();
         let message_config = MessageConfig::default();
         let dictionary = Dictionary::fix44();
@@ -960,7 +976,7 @@ mod tests {
         let ctx = SessionCtx {
             config,
             store,
-            application: NoOpApp,
+            application,
             message_builder,
             message_config,
         };
@@ -997,6 +1013,63 @@ mod tests {
             end_time: NaiveTime::from_hms_opt(end_hour, 0, 0).unwrap(),
             timezone: Tz::UTC,
         }
+    }
+
+    /// Records the MsgType of every inbound message the session hands over.
+    struct RecordingApp(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+    #[async_trait::async_trait]
+    impl Application for RecordingApp {
+        type Outbound = DummyMessage;
+
+        async fn on_outbound_message(&self, _: &Self::Outbound) -> OutboundDecision {
+            OutboundDecision::Send
+        }
+
+        async fn on_inbound_message(&self, msg: &Message) -> InboundDecision {
+            let msg_type: &str = msg.header().get(MSG_TYPE).unwrap_or("?");
+            self.0.lock().unwrap().push(msg_type.to_string());
+            InboundDecision::Accept
+        }
+
+        async fn on_logout(&mut self, _: &str) {}
+        async fn on_logon(&mut self) {}
+        async fn on_state_change(&self, _: &Status, _: &Status) {}
+    }
+
+    /// A session-level Reject (35=3) reaches the application, with its
+    /// RefSeqNum, after the session has accounted for it.
+    #[tokio::test]
+    async fn a_session_reject_is_handed_to_the_application() {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let writer = create_writer_ref();
+        let state = SessionState::new_active(writer, 30);
+        let store = TestStore::new(Utc::now());
+        let mut session = create_test_session_with(
+            RecordingApp(seen.clone()),
+            SessionSchedule::NonStop,
+            state,
+            store,
+        );
+        let mut message = Message::new("FIX.4.4", Reject::MSG_TYPE);
+        message.set(hotfix_message::fix44::SENDER_COMP_ID, "TARGET");
+        message.set(hotfix_message::fix44::TARGET_COMP_ID, "SENDER");
+        message.set(hotfix_message::fix44::MSG_SEQ_NUM, 2u64);
+        message.set(
+            hotfix_message::fix44::SENDING_TIME,
+            hotfix_message::field_types::Timestamp::utc_now(),
+        );
+        message.set(hotfix_message::fix44::REF_SEQ_NUM, 7u64);
+        message.set(hotfix_message::fix44::REF_MSG_TYPE, "D");
+        message.set(hotfix_message::fix44::SESSION_REJECT_REASON, 0u32);
+        message.set(hotfix_message::fix44::TEXT, "invalid field 887");
+        session.on_reject(&message).await.expect("accounted for");
+        assert_eq!(seen.lock().unwrap().as_slice(), ["3"]);
+        assert_eq!(
+            message.get::<u64>(hotfix_message::fix44::REF_SEQ_NUM).ok(),
+            Some(7),
+            "the application reads which message was refused from the same message"
+        );
     }
 
     #[tokio::test]
