@@ -1,7 +1,7 @@
 //! FIX initiator implementation.
 //!
-//! The fIX session that initiates the connection with its peer,
-//! the acceptor. Currently, `HotFIX` only supports initiators.
+//! The FIX session that initiates the connection with its peer, the
+//! acceptor (see [`crate::acceptor`] for the other side).
 //!
 //! The initiator establishes the transport layer connection with
 //! the peer, and sends the initial Logon (35=A) message. For transport,
@@ -380,6 +380,7 @@ mod tests {
             logout_timeout: 2,
             reconnect_interval: 1, // Short for tests
             reset_on_logon: false,
+            role: Default::default(),
             schedule: None,
         }
     }
@@ -554,6 +555,53 @@ mod tests {
         assert!(
             accept_result.is_ok(),
             "Initiator should reconnect after disconnect"
+        );
+    }
+
+    /// Shutdown of a session whose connection has ALREADY dropped must
+    /// terminate the connection loop — the venue-restart case. Before the
+    /// `initiate_graceful_logout` disconnected-branch fix, the request hit
+    /// the no-writer guard and the pre-drop `Disconnected {{ reconnect: true }}`
+    /// survived: the loop kept reconnecting as a zombie, racing any
+    /// replacement session for the counterparty's single session slot
+    /// (spline-connect bead nnf).
+    #[tokio::test]
+    async fn shutdown_terminates_an_already_disconnected_session() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mut config = create_test_config("127.0.0.1", port);
+        config.reconnect_interval = 1;
+
+        let initiator = Initiator::<DummyMessage>::start(
+            config.clone(),
+            NoOpApp,
+            InMemoryMessageStore::default(),
+        )
+        .await
+        .unwrap();
+
+        // Complete a logon, then drop the counterparty uncleanly (the
+        // "venue restarted" shape — no Logout, the writer just dies).
+        let mut counterparty = TestCounterparty::accept(&listener, &config).await;
+        counterparty.expect_message("A").await;
+        counterparty.send_logon(30).await;
+        sleep(Duration::from_millis(50)).await;
+        drop(counterparty);
+
+        // Let the session observe the drop and enter Disconnected{reconnect}.
+        sleep(Duration::from_millis(200)).await;
+
+        // An explicit no-reconnect shutdown must complete (the loop exits)…
+        tokio::time::timeout(Duration::from_secs(5), initiator.shutdown(false))
+            .await
+            .expect("shutdown must not hang on a disconnected session")
+            .expect("shutdown must succeed");
+
+        // …and the zombie must be dead: no further connection attempt lands.
+        let no_reconnect = tokio::time::timeout(Duration::from_secs(2), listener.accept()).await;
+        assert!(
+            no_reconnect.is_err(),
+            "connection loop kept reconnecting after shutdown(false)"
         );
     }
 

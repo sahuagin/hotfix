@@ -23,7 +23,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::Application;
 use crate::application::{InboundDecision, OutboundDecision};
-use crate::config::SessionConfig;
+use crate::config::{SessionConfig, SessionRole};
 use crate::message::OutboundMessage;
 use crate::message::business_reject::BusinessReject;
 use crate::message::heartbeat::Heartbeat;
@@ -53,9 +53,11 @@ use crate::session_schedule::{SessionPeriodComparison, SessionSchedule};
 use crate::store::MessageStore;
 use crate::transport::writer::WriterRef;
 use crate::wire_observer::WireObserverHandle;
-use event::SessionEvent;
+use event::{ScheduleResponse, SessionEvent};
 use hotfix_message::parsed_message::{InvalidReason, ParsedMessage};
-use hotfix_message::session_fields::{MSG_SEQ_NUM, MSG_TYPE, SessionRejectReason, TEST_REQ_ID};
+use hotfix_message::session_fields::{
+    MSG_SEQ_NUM, MSG_TYPE, RESET_SEQ_NUM_FLAG, SessionRejectReason, TEST_REQ_ID,
+};
 
 const SCHEDULE_CHECK_INTERVAL: u64 = 1;
 
@@ -215,6 +217,19 @@ where
             .get(MSG_TYPE)
             .map_err(|_| SessionOperationError::MissingField("MSG_TYPE"))?;
 
+        // Acceptor mirror of `reset_on_logon` (`send_logon` resets the store
+        // before announcing 141=Y): an inbound Logon carrying 141=Y resets
+        // both sequence streams BEFORE verification, so the peer's seq-1
+        // logon verifies clean against the just-reset store instead of
+        // reading as a sequence regression on re-logon.
+        if self.ctx.config.role == SessionRole::Acceptor
+            && self.state.is_awaiting_logon()
+            && message_type == Logon::MSG_TYPE
+            && message.get(RESET_SEQ_NUM_FLAG).unwrap_or(false)
+        {
+            self.ctx.store.reset().await?;
+        }
+
         let flags = VerificationFlags::for_message(&message)?;
         if let VerificationResult::Issue(result) = self
             .state
@@ -245,7 +260,7 @@ where
                 self.on_logout().await?;
             }
             Logon::MSG_TYPE => {
-                self.on_logon().await?;
+                self.on_logon(&message).await?;
             }
             _ => self.process_app_message(&message).await?,
         }
@@ -334,7 +349,12 @@ where
         )))
         .await;
         self.reset_peer_timer(None);
-        self.send_logon().await?;
+        // The initiator speaks first. An acceptor waits in AwaitingLogon for
+        // the peer's Logon — logon_timeout covers a silent client the same
+        // way it covers an unresponsive venue.
+        if self.ctx.config.role == SessionRole::Initiator {
+            self.send_logon().await?;
+        }
 
         Ok(())
     }
@@ -345,8 +365,8 @@ where
         self.apply_transition(transition).await;
     }
 
-    async fn on_logon(&mut self) -> Result<(), SessionOperationError> {
-        let transition = self.state.on_peer_logon(&mut self.ctx).await?;
+    async fn on_logon(&mut self, message: &Message) -> Result<(), SessionOperationError> {
+        let transition = self.state.on_peer_logon(&mut self.ctx, message).await?;
         self.apply_transition(transition).await;
         Ok(())
     }
@@ -538,7 +558,17 @@ where
                 }
             }
             SessionEvent::AwaitSchedule(responder) => {
-                self.state.register_schedule_awaiter(responder);
+                // A session told not to reconnect must never be handed back
+                // to the connect loop by the next schedule tick — answer
+                // Shutdown at the gate. Without this, a shutdown that lands
+                // while the loop is between connection attempts is
+                // steamrolled by the NEXT connect (which rebuilds state and
+                // forgets the request) — the zombie-reconnect wedge.
+                if self.state.should_reconnect() {
+                    self.state.register_schedule_awaiter(responder);
+                } else if responder.send(ScheduleResponse::Shutdown).is_err() {
+                    warn!("tried to respond Shutdown to AwaitSchedule but the receiver is gone");
+                }
             }
         }
     }
@@ -920,6 +950,7 @@ mod tests {
             logout_timeout: 2,
             reconnect_interval: 30,
             reset_on_logon: false,
+            role: Default::default(),
             schedule: None,
         }
     }

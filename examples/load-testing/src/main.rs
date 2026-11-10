@@ -168,5 +168,6 @@ fn get_config() -> SessionConfig {
         reconnect_interval: 30,
         reset_on_logon: true,
         schedule: None,
+        role: Default::default(),
     }
 }

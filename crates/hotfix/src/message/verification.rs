@@ -257,6 +257,7 @@ mod tests {
             logout_timeout: 0,
             reconnect_interval: 0,
             reset_on_logon: false,
+            role: Default::default(),
             schedule: None,
         }
     }

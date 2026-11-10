@@ -90,6 +90,7 @@ pub(crate) fn create_test_ctx(store: FakeMessageStore) -> SessionCtx<(), FakeMes
             logout_timeout: 2,
             reconnect_interval: 30,
             reset_on_logon: false,
+            role: Default::default(),
             schedule: None,
         },
         store,

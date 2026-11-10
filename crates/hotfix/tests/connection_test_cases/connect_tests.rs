@@ -25,6 +25,7 @@ fn create_session_config(host: &str, port: u16, tls_config: Option<TlsConfig>) -
         logout_timeout: 2,
         reconnect_interval: 30,
         reset_on_logon: false,
+        role: Default::default(),
         schedule: None,
     }
 }
