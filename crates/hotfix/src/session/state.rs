@@ -216,7 +216,7 @@ impl SessionState {
         if let Some(writer) = self.get_writer() {
             TransitionResult::TransitionTo(SessionState::AwaitingLogout(AwaitingLogoutState {
                 writer: writer.clone(),
-                logout_timeout: Instant::now() + logout_timeout,
+                logout_timeout: Some(Instant::now() + logout_timeout),
                 reconnect,
             }))
         } else {
@@ -416,11 +416,29 @@ impl SessionState {
     pub fn peer_deadline(&self) -> Option<&Instant> {
         match self {
             Self::Active(ActiveState { peer_deadline, .. }) => Some(peer_deadline),
-            Self::AwaitingLogon(AwaitingLogonState { logon_timeout, .. }) => Some(logon_timeout),
+            Self::AwaitingLogon(AwaitingLogonState { logon_timeout, .. }) => logon_timeout.as_ref(),
             Self::AwaitingLogout(AwaitingLogoutState { logout_timeout, .. }) => {
-                Some(logout_timeout)
+                logout_timeout.as_ref()
             }
             _ => None,
+        }
+    }
+
+    /// Stops the peer timer of a session that is waiting for a Logon or a
+    /// Logout answer, once that wait has timed out and the disconnect has been
+    /// requested. The session loop re-arms its peer-timer arm from
+    /// `peer_deadline` on every iteration, so a deadline that has already
+    /// passed must be withdrawn or the arm fires continuously until the
+    /// reader's Disconnected event changes the state. An active session's
+    /// peer timer is re-armed by `reset_peer_timer` instead and is not
+    /// touched here.
+    pub fn disarm_peer_timer(&mut self) {
+        match self {
+            Self::AwaitingLogon(AwaitingLogonState { logon_timeout, .. }) => *logon_timeout = None,
+            Self::AwaitingLogout(AwaitingLogoutState { logout_timeout, .. }) => {
+                *logout_timeout = None
+            }
+            _ => {}
         }
     }
 

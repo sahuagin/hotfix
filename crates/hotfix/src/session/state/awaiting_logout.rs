@@ -12,8 +12,10 @@ use tracing::warn;
 pub(crate) struct AwaitingLogoutState {
     /// The writer's reference to send messages to the counterparty
     pub(crate) writer: WriterRef,
-    /// When we are expecting the Logout response at the latest
-    pub(crate) logout_timeout: Instant,
+    /// When we are expecting the Logout response at the latest. `None` once
+    /// the timeout has fired and the disconnect is under way (see
+    /// `AwaitingLogonState::logon_timeout`).
+    pub(crate) logout_timeout: Option<Instant>,
     /// Indicates whether we should attempt to reconnect after we've fully logged out
     pub(crate) reconnect: bool,
 }
