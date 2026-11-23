@@ -344,7 +344,9 @@ where
             AwaitingLogonState {
                 writer,
                 logon_sent: false,
-                logon_timeout: Instant::now() + Duration::from_secs(self.ctx.config.logon_timeout),
+                logon_timeout: Some(
+                    Instant::now() + Duration::from_secs(self.ctx.config.logon_timeout),
+                ),
             },
         )))
         .await;
@@ -637,10 +639,17 @@ where
                 .logout_and_terminate(&mut self.ctx, "peer timeout")
                 .await;
         } else if self.state.is_awaiting_logon() {
+            // Disarm first: the state stays AwaitingLogon until the reader
+            // reports the disconnect, and the select loop would otherwise
+            // re-fire this arm on the elapsed deadline every iteration until
+            // then, logging this line and sending Disconnect into a closed
+            // writer channel each time.
             warn!("peer didn't respond to our Logon, disconnecting..");
+            self.state.disarm_peer_timer();
             self.state.disconnect_writer().await;
         } else if self.state.is_awaiting_logout() {
             warn!("peer didn't respond to our Logout, disconnecting..");
+            self.state.disarm_peer_timer();
             self.state.disconnect_writer().await;
         } else {
             let req_id = format!("TEST_{}", self.ctx.store.next_target_seq_number());
@@ -809,7 +818,9 @@ mod tests {
     use super::*;
     use crate::application::{InboundDecision, OutboundDecision};
     use crate::message::OutboundMessage;
+    use crate::session::state::AwaitingLogoutState;
     use crate::store::{Result as StoreResult, StoreError};
+    use crate::transport::writer::WriterMessage;
     use chrono::{DateTime, Datelike, NaiveDate, NaiveTime, TimeDelta, Timelike};
     use chrono_tz::Tz;
     use hotfix_message::message::Message;
@@ -997,6 +1008,72 @@ mod tests {
             end_time: NaiveTime::from_hms_opt(end_hour, 0, 0).unwrap(),
             timezone: Tz::UTC,
         }
+    }
+
+    /// Drains the writer channel and counts the Disconnect requests on it.
+    fn disconnects_sent(writer_rx: &mut mpsc::Receiver<WriterMessage>) -> usize {
+        let mut n = 0;
+        while let Ok(msg) = writer_rx.try_recv() {
+            assert!(
+                matches!(msg, WriterMessage::Disconnect),
+                "only a disconnect is expected on the writer after a timeout"
+            );
+            n += 1;
+        }
+        n
+    }
+
+    /// An unanswered Logon fires the peer timer exactly once. The session
+    /// loop re-arms its peer-timer arm from `peer_deadline` on every
+    /// iteration and the state stays AwaitingLogon until the reader reports
+    /// the disconnect, so the timeout must withdraw the elapsed deadline or
+    /// the arm fires again on every iteration until then (observed as
+    /// thousands of identical warnings per timeout).
+    #[tokio::test]
+    async fn an_unanswered_logon_fires_the_peer_timer_once() {
+        let (sender, mut writer_rx) = mpsc::channel(10);
+        let state = SessionState::AwaitingLogon(AwaitingLogonState {
+            writer: WriterRef::new(sender),
+            logon_sent: true,
+            logon_timeout: Some(Instant::now() - Duration::from_secs(1)),
+        });
+        let mut session =
+            create_test_session(SessionSchedule::NonStop, state, TestStore::new(Utc::now()));
+        assert!(
+            session.state.peer_deadline().is_some(),
+            "the deadline is armed before it fires"
+        );
+
+        session.handle_peer_timeout().await;
+
+        assert!(
+            session.state.peer_deadline().is_none(),
+            "the elapsed deadline is withdrawn, so the loop's timer arm stays pending"
+        );
+        assert!(
+            session.state.is_awaiting_logon(),
+            "the state is the reader's to change, on its Disconnected event"
+        );
+        assert_eq!(disconnects_sent(&mut writer_rx), 1);
+    }
+
+    /// The same for an unanswered Logout.
+    #[tokio::test]
+    async fn an_unanswered_logout_fires_the_peer_timer_once() {
+        let (sender, mut writer_rx) = mpsc::channel(10);
+        let state = SessionState::AwaitingLogout(AwaitingLogoutState {
+            writer: WriterRef::new(sender),
+            logout_timeout: Some(Instant::now() - Duration::from_secs(1)),
+            reconnect: true,
+        });
+        let mut session =
+            create_test_session(SessionSchedule::NonStop, state, TestStore::new(Utc::now()));
+
+        session.handle_peer_timeout().await;
+
+        assert!(session.state.peer_deadline().is_none());
+        assert!(session.state.is_awaiting_logout());
+        assert_eq!(disconnects_sent(&mut writer_rx), 1);
     }
 
     #[tokio::test]

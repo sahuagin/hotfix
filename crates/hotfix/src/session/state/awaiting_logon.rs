@@ -21,8 +21,12 @@ pub(crate) struct AwaitingLogonState {
     pub(crate) writer: WriterRef,
     /// Indicates whether we have sent Logon - safeguards against accidental double sends
     pub(crate) logon_sent: bool,
-    /// When we are expecting the Logon response at the latest
-    pub(crate) logon_timeout: Instant,
+    /// When we are expecting the Logon response at the latest. `None` once
+    /// the timeout has fired and the disconnect is under way: the session
+    /// loop's peer-timer arm sleeps until this deadline, so an elapsed one
+    /// left in place would fire again on every iteration until the reader's
+    /// Disconnected event arrives.
+    pub(crate) logon_timeout: Option<Instant>,
 }
 
 impl AwaitingLogonState {
