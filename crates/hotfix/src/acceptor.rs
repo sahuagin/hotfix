@@ -283,6 +283,7 @@ mod tests {
             connection_port: port,
             tls_config: None,
             heartbeat_interval: 30,
+            sending_time_tolerance: 120,
             logon_timeout: 5,
             logout_timeout: 2,
             reconnect_interval: 1,

@@ -114,6 +114,7 @@ pub fn create_session_config() -> SessionConfig {
         connection_port: 0,
         tls_config: None,
         heartbeat_interval: HEARTBEAT_INTERVAL,
+        sending_time_tolerance: 120,
         logon_timeout: LOGON_TIMEOUT,
         logout_timeout: LOGOUT_TIMEOUT,
         reconnect_interval: 30,

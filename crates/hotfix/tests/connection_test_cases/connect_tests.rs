@@ -21,6 +21,7 @@ fn create_session_config(host: &str, port: u16, tls_config: Option<TlsConfig>) -
         connection_port: port,
         tls_config,
         heartbeat_interval: 30,
+        sending_time_tolerance: 120,
         logon_timeout: 10,
         logout_timeout: 2,
         reconnect_interval: 30,
