@@ -80,6 +80,11 @@ fn default_logout_timeout() -> u64 {
     2
 }
 
+/// FIX 4.x's SendingTime accuracy window: two minutes.
+fn default_sending_time_tolerance() -> u64 {
+    120
+}
+
 /// The configuration of a single FIX session.
 #[derive(Clone, Debug, Deserialize)]
 pub struct SessionConfig {
@@ -110,6 +115,18 @@ pub struct SessionConfig {
 
     /// The heartbeat interval to agree on with the peer in seconds.
     pub heartbeat_interval: u64,
+
+    /// How far, in seconds either way, an inbound message's SendingTime (52)
+    /// may be from this host's clock before the message is rejected with
+    /// SessionRejectReason 10 (SendingTime accuracy problem). FIX 4.x puts
+    /// the figure at two minutes, and that is the default. A session whose
+    /// peer stamps messages when it generates them and ships them later —
+    /// a market-data feed sending a large snapshot behind a slow link, say —
+    /// can set it wider; the alternative is a session that rejects every
+    /// record once the backlog is two minutes deep and is then dropped by
+    /// the peer. Per session, so an order session keeps the strict figure.
+    #[serde(default = "default_sending_time_tolerance")]
+    pub sending_time_tolerance: u64,
 
     /// The time we wait in seconds for Logon responses before timing out.
     #[serde(default = "default_logon_timeout")]

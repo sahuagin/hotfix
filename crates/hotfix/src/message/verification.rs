@@ -15,9 +15,6 @@ use hotfix_message::session_fields::{
 use std::cmp::Ordering;
 use tracing::error;
 
-/// Maximum allowed difference in seconds between SendingTime and current time
-const SENDING_TIME_THRESHOLD: u64 = 120;
-
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct VerificationFlags {
     pub(crate) check_too_high: bool,
@@ -88,7 +85,8 @@ pub(crate) fn verify_message(
     check_target_comp_id(message, actual_seq_number, expected_target_comp_id)?;
 
     // check SendingTime and OrigSendingTime
-    let sending_time = check_sending_time(message, actual_seq_number)?;
+    let sending_time =
+        check_sending_time(message, actual_seq_number, config.sending_time_tolerance)?;
     let possible_duplicate = message.header().get::<bool>(POSS_DUP_FLAG).unwrap_or(false);
     if flags.check_orig_sending_time {
         check_original_sending_time(message, actual_seq_number, sending_time)?;
@@ -116,7 +114,13 @@ fn check_begin_string(message: &Message, expected_begin_string: &str) -> Result<
     Ok(())
 }
 
-fn check_sending_time(message: &Message, sequence_number: u64) -> Result<Timestamp, MessageError> {
+/// `tolerance_secs` is the session's `sending_time_tolerance` (see
+/// [`SessionConfig`]): how far SendingTime may sit from this host's clock.
+fn check_sending_time(
+    message: &Message,
+    sequence_number: u64,
+    tolerance_secs: u64,
+) -> Result<Timestamp, MessageError> {
     // Validate SendingTime presence
     let sending_time = match message.header().get::<Timestamp>(SENDING_TIME) {
         Ok(st) => st,
@@ -138,7 +142,7 @@ fn check_sending_time(message: &Message, sequence_number: u64) -> Result<Timesta
             now_chrono - sending_chrono
         };
 
-        if diff.num_seconds() > SENDING_TIME_THRESHOLD as i64 {
+        if diff.num_seconds() > tolerance_secs as i64 {
             return Err(MessageError::SendingTimeAccuracyIssue {
                 msg_seq_num: sequence_number,
             });
@@ -253,6 +257,7 @@ mod tests {
             connection_port: 9999,
             tls_config: None,
             heartbeat_interval: 0,
+            sending_time_tolerance: 120,
             logon_timeout: 0,
             logout_timeout: 0,
             reconnect_interval: 0,
@@ -974,6 +979,40 @@ mod tests {
         {
             assert_eq!(msg_seq_num, 42);
         }
+    }
+
+    /// The window is the session's, not the crate's: a message 200 s old is
+    /// rejected under the default two minutes and accepted by a session
+    /// configured for five (a market-data feed whose peer stamps on generation
+    /// and ships behind a backlog, 2026-11-25).
+    #[test]
+    fn test_sending_time_tolerance_is_per_session() {
+        use chrono::Duration;
+
+        let mut msg = Message::new("FIX.4.4", "D");
+        msg.set(fix44::SENDER_COMP_ID, "TARGET");
+        msg.set(fix44::TARGET_COMP_ID, "SENDER");
+        msg.set(fix44::MSG_SEQ_NUM, 42u64);
+        let past: Timestamp = (chrono::Utc::now() - Duration::seconds(200))
+            .naive_utc()
+            .into();
+        msg.set(fix44::SENDING_TIME, past);
+        let flags = VerificationFlags::new(true, true, false);
+
+        let strict = build_test_config();
+        assert_eq!(strict.sending_time_tolerance, 120);
+        assert!(matches!(
+            verify_message(&msg, &strict, Some(42), flags),
+            Err(VerificationIssue::InvalidMessage(
+                MessageError::SendingTimeAccuracyIssue { .. }
+            ))
+        ));
+
+        let wide = SessionConfig {
+            sending_time_tolerance: 300,
+            ..build_test_config()
+        };
+        assert!(verify_message(&msg, &wide, Some(42), flags).is_ok());
     }
 
     #[test]
